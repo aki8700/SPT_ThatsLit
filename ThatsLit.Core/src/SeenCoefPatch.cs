@@ -1,8 +1,9 @@
-#define DEBUG_DETAILS
+﻿#define DEBUG_DETAILS
 using SPT.Reflection.Patching;
 using EFT;
 using HarmonyLib;
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
 using Comfort.Common;
@@ -14,21 +15,44 @@ namespace ThatsLit
 {
     public class SeenCoefPatch : ModulePatch
     {
-        private static PropertyInfo _enemyRel;
+        private static readonly AccessTools.FieldRef<EnemyInfo, Dictionary<BodyPartType, EnemyPartVision>> _allPartsVisionRef
+            = AccessTools.FieldRefAccess<EnemyInfo, Dictionary<BodyPartType, EnemyPartVision>>("_allPartsVision");
 
         protected override MethodBase GetTargetMethod()
         {
-            return ReflectionHelper.FindMethodByArgTypes(typeof(EnemyInfo), new Type[] { typeof(BifacialTransform), typeof(BifacialTransform), typeof(BotDifficultySettingsClass), typeof(IAIData), typeof(float), typeof(Vector3) }); ;
+            // EFT 40743: the old seen-coef method (returning "seconds to be seen") is replaced by
+            // GetVisibilityChangeSpeedK, which returns a SPEED multiplier K. Time to full visibility is
+            // t = 1 / (VISIBILITY_CHANGE_SPEED * K). The pipeline below still works in the seconds domain,
+            // so K is converted to seconds on entry and back to K on exit (polarity: more seconds => smaller K).
+            return AccessTools.Method(typeof(EnemyInfo), nameof(EnemyInfo.GetVisibilityChangeSpeedK));
         }
 
+        [ThreadStatic] internal static BotOwner _lastThresholdBot;
+        [ThreadStatic] internal static int _lastThresholdFrame;
+        [ThreadStatic] internal static float _lastThresholdVcs;
+
         [PatchPostfix]
-        [HarmonyAfter("me.sol.sain")]
-        public static void PatchPostfix(EnemyInfo __instance, BifacialTransform BotTransform, BifacialTransform enemy, float personalLastSeenTime, Vector3 personalLastSeenPos, ref float __result)
+        // SAIN's patches are SPT ModulePatches whose Harmony id is the patch class name, so "me.sol.sain" alone never matched.
+        [HarmonyAfter("me.sol.sain", "VisionSpeedPatch")]
+        public static void PatchPostfix(EnemyInfo __instance, float personalLastSeenTime, Vector3 personalLastSeenPos, float deltaTime, ref float __result)
         {
+            // Always clear previous enemy's threshold context so non-That's-Lit enemies (e.g. AI vs AI) in the same frame never inherit it.
+            _lastThresholdBot = null;
+
             // Don't use GoalEnemy here because it only change when engaging new enemy (it'll stay indifinitely if not engaged with new enemy)
             // Also they could search without having visual?
 
-            if (__result >= 8888
+            float k0 = __result;
+            if (!(k0 > 1e-6f) || float.IsInfinity(k0) || float.IsNaN(k0)) return;
+            if (__instance?.Owner?.LookSensor == null || __instance.Person == null) return;
+            float vcs = __instance.Owner.Settings?.FileSettings?.Look?.VISIBILITY_CHANGE_SPEED ?? 1f;
+            if (!(vcs > 0f) || float.IsInfinity(vcs) || float.IsNaN(vcs)) vcs = 1f;
+            double seenSecD = 1.0 / ((double)k0 * (double)vcs);
+            if (double.IsNaN(seenSecD) || double.IsInfinity(seenSecD) || seenSecD >= 8888.0) return;
+            float seenSec = (float)seenSecD;
+
+            if (seenSec >= 8888
+             || float.IsNaN(seenSec) || float.IsInfinity(seenSec)
              || !ThatsLitPlugin.EnabledMod.Value
              || (ThatsLitPlugin.FinalImpactScaleDelaying.Value == 0 && ThatsLitPlugin.FinalImpactScaleFastening.Value == 0)
              || ThatsLitPlugin.PMCOnlyMode.Value && !Utility.IsPMCSpawnType(__instance.Owner?.Profile?.Info?.Settings?.Role))
@@ -46,7 +70,7 @@ namespace ThatsLit
              || player.Player == null)
                 return;
 
-            var original = __result;
+            var original = seenSec;
 
             if (player.DebugInfo != null && ThatsLitPlayer.IsDebugSampleFrame)
             {
@@ -67,8 +91,10 @@ namespace ThatsLit
             float deNullification = 0;
 
             System.Collections.Generic.Dictionary<BodyPartType, EnemyPart> playerParts = player.Player.MainParts;
-            Vector3 eyeToPlayerBody = playerParts[BodyPartType.body].Position - __instance.Owner.MainParts[BodyPartType.head].Position;
-            Vector3 eyeToLastSeenPos = __instance.EnemyLastPositionReal - __instance.Owner.MainParts[BodyPartType.head].Position;
+            BifacialTransform BotTransform = __instance.Owner.Transform;
+            var botHead = __instance.Owner.MainParts[BodyPartType.head];
+            Vector3 eyeToPlayerBody = playerParts[BodyPartType.body].Position - botHead.Position;
+            Vector3 eyeToLastSeenPos = __instance.EnemyLastPositionReal - botHead.Position;
 
             bool isInPronePose = __instance.Person.AIData.Player.IsInPronePose;
             float pPoseFactor = Utility.GetPoseFactor(__instance.Person.AIData.Player.PoseLevel, __instance.Person.AIData.Player.Physical.MaxPoseLevel, isInPronePose);
@@ -84,7 +110,9 @@ namespace ThatsLit
             Vector3 botVisionDir = __instance.Owner.GetPlayer.LookDirection;
             var visionAngleDelta = Vector3.Angle(botVisionDir, eyeToPlayerBody);
             var visionAngleDelta90Clamped = Mathf.InverseLerp(0, 90f, visionAngleDelta);
-            var visionAngleDeltaHorizontalSigned = Vector3.SignedAngle(botVisionDir, eyeToPlayerBody, Vector3.up);
+            // == Vector3.SignedAngle(botVisionDir, eyeToPlayerBody, Vector3.up) without recomputing Angle():
+            // Unity: Angle(from, to) * Mathf.Sign(axis . cross(from, to)), Mathf.Sign(f) = f >= 0 ? 1 : -1 (same float ops).
+            var visionAngleDeltaHorizontalSigned = visionAngleDelta * (Vector3.Dot(Vector3.up, Vector3.Cross(botVisionDir, eyeToPlayerBody)) < 0f ? -1f : 1f);
             var visionAngleDeltaHorizontal = Mathf.Abs(visionAngleDeltaHorizontalSigned);
             // negative if looking down (from higher pos), 0 when looking straight...
             var visionAngleDeltaVertical = Vector3.Angle(new Vector3(eyeToPlayerBody.x, 0, eyeToPlayerBody.z), eyeToPlayerBody); 
@@ -108,20 +136,21 @@ namespace ThatsLit
             float disFactorSmooth = 0;
             bool inThermalView = false;
             bool inNVGView = false;
-            bool gearBlocking = false; // Not blokcing for now, because AIs don't look around (nvg/thermal still ineffective when out of FOV)
             float insideTime = Mathf.Max(0, Time.time - player.lastOutside);
 
-            float shotAngleDelta = Vector3.Angle(-eyeToPlayerBody, player.lastShotVector);
             float facingShotFactor = 0f;
             if (player.lastShotVector != Vector3.zero && Time.time - player.lastShotTime < 0.5f)
+            {
+                float shotAngleDelta = Vector3.Angle(-eyeToPlayerBody, player.lastShotVector); // only needed for a recent shot
                 facingShotFactor = Mathf.InverseLerp(15f, 0f, shotAngleDelta) * Mathf.InverseLerp(0.5f, 0f, Time.time - player.lastShotTime);
+            }
 
             float aimSin = Mathf.Sin(Time.time / (1 + 0.1f * caution) + (__instance.Owner.Position.x + __instance.Owner.Position.z) % 2f);
             ThatsLitCompat.ScopeTemplate activeScope = null;
             BotNightVisionData nightVision = __instance.Owner.NightVision;
             ThatsLitCompat.GoggleTemplate activeGoggle = null;
             if (nightVision?.UsingNow == true) 
-                if (ThatsLitCompat.Goggles.TryGetValue(nightVision.NightVisionItem.Item.TemplateId, out var goggle))
+                if (ThatsLitCompat.Goggles.TryGetValue(nightVision.NightVisionItem?.Item?.StringTemplateId ?? string.Empty, out var goggle))
                     activeGoggle = goggle?.TemplateInstance;
             if (activeGoggle != null) 
             {
@@ -136,7 +165,6 @@ namespace ThatsLit
                     }
                     else
                     {
-                        gearBlocking = true;
                     }
                  }
                 else if (nightVision.NightVisionItem?.Template?.Mask != NightVisionComponent.EMask.Thermal
@@ -149,7 +177,6 @@ namespace ThatsLit
                     }
                     else
                     {
-                        gearBlocking = true;
                     }
                 }
             }
@@ -157,7 +184,7 @@ namespace ThatsLit
             {
                 EFT.InventoryLogic.SightComponent sightMod = __instance.Owner?.GetPlayer?.ProceduralWeaponAnimation?.CurrentAimingMod;
                 if (sightMod != null)
-                    if (ThatsLitCompat.Scopes.TryGetValue(sightMod.Item.TemplateId, out var scope))
+                    if (ThatsLitCompat.Scopes.TryGetValue(sightMod.Item?.StringTemplateId ?? string.Empty, out var scope))
                         activeScope = scope?.TemplateInstance;
                 if (activeScope != null) {
                     if (rand1 < 0.1f) sightMod.SetScopeMode(UnityEngine.Random.Range(0, sightMod.ScopesCount), UnityEngine.Random.Range(0, 2));
@@ -207,18 +234,17 @@ namespace ThatsLit
             if (visionAngleDelta > 85) canSeeLaserSub = false;
 
             bool nearestAI = false;
-            if (player.lastNearest == null || Vector3.Distance(player.Player.Position, player.lastNearest?.Position ?? Vector3.zero) > dis)
+            float currentBotDistanceSqr = (player.Player.Position - __instance.Owner.Position).sqrMagnitude;
+            if (player.lastNearest == null || (player.Player.Position - player.lastNearest.Position).sqrMagnitude > currentBotDistanceSqr)
             {
                 player.lastNearest = __instance.Owner;
-                float lastNearestDistance = Vector3.Distance(player.Player.Position, player.lastNearest.Position);
                 if (player.DebugInfo != null)
-                {
-                    player.DebugInfo.lastNearest = lastNearestDistance;
-                    player.lastNearest = __instance.Owner;
-                }
+                    player.DebugInfo.lastNearest = Mathf.Sqrt(currentBotDistanceSqr);
             }
             nearestAI = player.lastNearest == __instance.Owner;
-            if (ShouldLogSeenCoef())
+            bool shouldLogSeenCoef = player.DebugInfo != null && nearestAI
+                && (!__instance.IsVisible || Time.frameCount % ThatsLitPlayer.DEBUG_INTERVAL == ThatsLitPlayer.DEBUG_INTERVAL - 1);
+            if (shouldLogSeenCoef)
             {
                 player.DebugInfo.lastCalcFrom = original;
             }
@@ -261,8 +287,8 @@ namespace ThatsLit
 
                 if (rand1 < Mathf.Clamp(overheadChance, 0, 0.995f))
                 {
-                    __result += rand5 * 0.1f;
-                    __result *= 10 + rand2 * 100;
+                    seenSec += rand5 * 0.1f;
+                    seenSec *= 10 + rand2 * 100;
                 }
             }
             // ======
@@ -275,7 +301,7 @@ namespace ThatsLit
                 if (!botIsInside && playerIsInside && insideTime >= 1)
                 {
                     var insideImpact = dis * Mathf.Clamp01(visionAngleDeltaVerticalSigned / 40f) * Mathf.Clamp01(visionAngleDelta / 60f) * (0.3f * seenPosDeltaFactorSqr + 0.7f * sinceSeenFactorSqr); // 50m -> 2.5/25 (BEST ANGLE), 10m -> 0.5/5
-                    __result *= 1 + insideImpact * (0.75f + rand3 * 0.05f * caution);
+                    seenSec *= 1 + insideImpact * (0.75f + rand3 * 0.05f * caution);
                 }
             }
 
@@ -300,19 +326,19 @@ namespace ThatsLit
             globalOverlookChance *= botImpactType != BotImpactType.DEFAULT? 0.5f : 1f;
             if (rand5 < globalOverlookChance)
             {
-                __result *= 10 + rand1 * 10; // Instead of set it to flat 8888, so if the player has been in the vision for quite some time, this don't block
+                seenSec *= 10 + rand1 * 10; // Instead of set it to flat 8888, so if the player has been in the vision for quite some time, this don't block
             }
 
             float score, factor;
 
-            if (player.PlayerLitScoreProfile == null)
+            if (!ThatsLitPlugin.EnabledLighting.Value || player.PlayerLitScoreProfile == null)
             {
                 score = factor = 0;
             }
             else if (inThermalView)
             {
                 score = factor = 0.7f;
-                if (player.CheckEffectDelegate(EStimulatorBuffType.BodyTemperature))
+                if (player.Player?.ActiveHealthController?.HasStimulatorBuff(EStimulatorBuffType.BodyTemperature) == true)
                     score = factor = 0.7f;
             }
             else
@@ -364,10 +390,10 @@ namespace ThatsLit
 
             if (player.DebugInfo != null)
             {
-                if (ShouldLogSeenCoef())
+                if (shouldLogSeenCoef)
                 {
                     player.DebugInfo.lastScore = score;
-                    player.DebugInfo.lastCalcTo0 = __result;
+                    player.DebugInfo.lastCalcTo0 = seenSec;
                     player.DebugInfo.lastFactor1 = factor;
                 }
                 player.DebugInfo.nearestCaution = caution;
@@ -377,16 +403,16 @@ namespace ThatsLit
             {
                 Vector2 bestMatchFoliageDir = Vector2.zero;
                 float bestMatchDeg = 360f;
-                float bestMatchDis = 0;
-                for (int i = 0; i < Math.Min(ThatsLitPlugin.FoliageSamples.Value, player.Foliage.FoliageCount); i++) {
+                int foliageSampleCount = Math.Min(ThatsLitPlugin.FoliageSamples.Value, player.Foliage.FoliageCount);
+                Vector2 playerToBotFoliageDir = new Vector2(-eyeToPlayerBody.x, -eyeToPlayerBody.z);
+                for (int i = 0; i < foliageSampleCount; i++) {
                     var f = player.Foliage.Foliage[i];
                     if (f == default) break;
-                    var fDeg = Vector2.Angle(new Vector2(-eyeToPlayerBody.x, -eyeToPlayerBody.z), f.dir);
+                    var fDeg = Vector2.Angle(playerToBotFoliageDir, f.dir);
                     if (fDeg < bestMatchDeg)
                     {
                         bestMatchDeg = fDeg;
                         bestMatchFoliageDir = f.dir;
-                        bestMatchDis = f.dis;
                     }
                 }
                 var foliageImpact = player.Foliage.FoliageScore;
@@ -403,20 +429,20 @@ namespace ThatsLit
                 foliageBlindChance *= 0.5f + 0.5f * visionAngleDelta90Clamped; // 50% effective when looking straight at the player
                 if (UnityEngine.Random.Range(0f, 1.01f) < foliageBlindChance) // Among bushes, from afar, always at least 5% to be uneffective
                 {
-                    __result += rand2;
-                    __result *= 1 + disFactor + rand4 * (5f + caution);
+                    seenSec += rand2;
+                    seenSec *= 1 + disFactor + rand4 * (5f + caution);
                 }
 
                 // if (ThatsLitPlugin.SAINLoaded && ThatsLitPlugin.InterruptSAINNoBush.Value) // Compensation for SAINNoBushOverride
                 // {
                 //     // Extra stealth at the other side of foliage
-                //     __result += 15f * sinceSeenFactorSqr * Mathf.InverseLerp(30f, 5f, bestMatchDeg) * Mathf.InverseLerp(15f, 1f, dis) * Mathf.InverseLerp(0, 1f, bestMatchDis);
+                //     seenSec += 15f * sinceSeenFactorSqr * Mathf.InverseLerp(30f, 5f, bestMatchDeg) * Mathf.InverseLerp(15f, 1f, dis);
                 // }
             }
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo1 = __result;
+                player.DebugInfo.lastCalcTo1 = seenSec;
             }
             // CBQ Factors =====
             // The closer it is, the higher the factors
@@ -526,7 +552,7 @@ namespace ThatsLit
                             detailImpact += (2f + rand5 * 3f) * (1f - disFactorSmooth) * (2f - visionAngleDelta90Clamped);
                             deNullification = 0.5f;
                         }
-                        __result *= 1 + detailImpact;
+                        seenSec *= 1 + detailImpact;
 
                         if (player.DebugInfo != null && nearestAI)
                         {
@@ -541,9 +567,9 @@ namespace ThatsLit
                 }
             }
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo2 = __result;
+                player.DebugInfo.lastCalcTo2 = seenSec;
             }
             // BUSH RAT ----------------------------------------------------------------------------------------------------------------
             /// Overlook when the bot has no idea the player is nearby and the player is sitting inside a bush
@@ -579,7 +605,7 @@ namespace ThatsLit
                     case "filbert_01":
                         angleFactor             = 1;
                         foliageDisFactor        = Mathf.InverseLerp(0.6f, 0.25f, nearestFoliage.dis);
-                        enemyDisFactor          = Mathf.InverseLerp(0f, 12f, dis); Mathf.Clamp01(dis / 12f); // 100% at 2.5m+
+                        enemyDisFactor          = Mathf.InverseLerp(0f, 12f, dis); // 100% at 2.5m+
                         poseScale               = Mathf.InverseLerp(0.75f, 0.3f, pPoseFactor);
                         break;
                     case "filbert_small01":
@@ -687,13 +713,13 @@ namespace ThatsLit
                 {
                     if (player.DebugInfo != null && nearestAI)
                         player.DebugInfo.IsBushRatting = bushRat;
-                    __result = Mathf.Max(__result, dis);
+                    seenSec = Mathf.Max(seenSec, dis);
                     switch (caution)
                     {
                         case 0:
                         case 1:
                             if (rand2 > 0.01f)
-                                __result *= 1 + 4 * bushRatFactor * UnityEngine.Random.Range(0.2f, 0.4f);
+                                seenSec *= 1 + 4 * bushRatFactor * UnityEngine.Random.Range(0.2f, 0.4f);
                             cqb6mTo1m *= 1f - bushRatFactor * 0.5f;
                             cqb11mTo1mSquared *= 1f - bushRatFactor * 0.5f;
                             break;
@@ -701,7 +727,7 @@ namespace ThatsLit
                         case 3:
                         case 4:
                             if (rand3 > 0.005f)
-                                __result *= 1 + 8 * bushRatFactor * UnityEngine.Random.Range(0.3f, 0.65f);
+                                seenSec *= 1 + 8 * bushRatFactor * UnityEngine.Random.Range(0.3f, 0.65f);
                             cqb6mTo1m *= 1f - bushRatFactor * 0.8f;
                             cqb11mTo1mSquared *= 1f - bushRatFactor * 0.8f;
                             break;
@@ -711,7 +737,7 @@ namespace ThatsLit
                         case 8:
                         case 9:
                             if (rand1 > 0.001f)
-                                __result *= 1 + 6 * bushRatFactor * UnityEngine.Random.Range(0.5f, 1.0f);
+                                seenSec *= 1 + 6 * bushRatFactor * UnityEngine.Random.Range(0.5f, 1.0f);
                             cqb6mTo1m *= 1f - bushRatFactor;
                             cqb11mTo1mSquared *= 1f - bushRatFactor;
                             break;
@@ -720,9 +746,9 @@ namespace ThatsLit
             }
             // BUSH RAT ----------------------------------------------------------------------------------------------------------------
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo3 = __result;
+                player.DebugInfo.lastCalcTo3 = seenSec;
             }
 
             /// -0.7 -> 0, -0.8 -> 0.33, -0.9 -> 0.66, -1 -> 1
@@ -733,8 +759,8 @@ namespace ThatsLit
             {
                 // https://www.desmos.com/calculator/jbghqfxwha
                 float cautionFactor = (caution / 9f - 0.5f) * (0.05f + 0.5f * rand4 * rand4); // -0.5(faster)~0.5(slower) squared curve distribution
-                __result += cautionFactor;
-                __result *= 1f + cautionFactor / 2f; // Factor in bot class
+                seenSec += cautionFactor;
+                seenSec *= 1f + cautionFactor / 2f; // Factor in bot class
             }
             else if (player.PlayerLitScoreProfile != null && Mathf.Abs(score) >= 0.05f) // Skip works
             {
@@ -754,8 +780,8 @@ namespace ThatsLit
                 secondsOffset += (original * (10f + rand1 * 20f) * (0.1f + 0.9f * sinceSeenFactorSqr * seenPosDeltaFactorSqr) * extremeDarkFactor) / pPoseFactor; // Makes night factory makes sense (filtered by extremeDarkFactor)
                 secondsOffset *= botImpactType == BotImpactType.DEFAULT? 1f : 0.5f;
                 secondsOffset *= secondsOffset > 0 ? ThatsLitPlugin.DarknessImpactScale : ThatsLitPlugin.BrightnessImpactScale;
-                __result += secondsOffset;
-                if (__result < 0) __result = 0;
+                seenSec += secondsOffset;
+                if (seenSec < 0) seenSec = 0;
 
 
                 // The scaling here allows the player to stay in the dark without being seen
@@ -779,7 +805,7 @@ namespace ThatsLit
                     forceStealthChance *= 0.4f + 0.6f * Mathf.Clamp01(notSeenRecentAndNear + attentionCancelChanceScaleByExDark);
                     if (UnityEngine.Random.Range(-1f, 0f) > forceStealthChance)
                     {
-                        __result *= 100 * ThatsLitPlugin.DarknessImpactScale;
+                        seenSec *= 100 * ThatsLitPlugin.DarknessImpactScale;
                     }
                     else
                     {
@@ -792,20 +818,20 @@ namespace ThatsLit
                         // -0.2 => 0.072
 
                         scale *= 0.7f + 0.3f * notSeenRecentAndNear;
-                        __result *= 1f+scale;
+                        seenSec *= 1f+scale;
                     }
 
                 }
                 else if (factor > 0)
                 {
-                    if (rand5 < factor * factor) __result *= 1f - 0.5f * ThatsLitPlugin.BrightnessImpactScale;
-                    else __result /= 1f + factor / 4f * ThatsLitPlugin.BrightnessImpactScale;
+                    if (rand5 < factor * factor) seenSec *= 1f - 0.5f * ThatsLitPlugin.BrightnessImpactScale;
+                    else seenSec /= 1f + factor / 4f * ThatsLitPlugin.BrightnessImpactScale;
                 }
             }
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo4 = __result;
+                player.DebugInfo.lastCalcTo4 = seenSec;
             }
             // Vanilla is multiplying the final SeenCoef with 1E-05
             // Probably to guarantee the continuance of the bot attention
@@ -813,9 +839,9 @@ namespace ThatsLit
             // This part, in a very conservative way, tries to randomly delay the reaction
             if (sinceSeen < __instance.Owner.Settings.FileSettings.Look.SEC_REPEATED_SEEN
                 && lastSeenPosDeltaSqr < __instance.Owner.Settings.FileSettings.Look.DIST_SQRT_REPEATED_SEEN
-                && __result < 0.5f)
+                && seenSec < 0.5f)
             {
-                __result += (0.5f - __result)
+                seenSec += (0.5f - seenSec)
                             * (rand1 * Mathf.Clamp01(visionAngleDelta / 90f)) // Scale-capped by horizontal vision angle delta
                             * (rand3 * Mathf.Clamp01(lastSeenPosDelta / 5f)) // Scale-capped by player position delta to last
                             * (__instance.Owner.Mover.Sprinting? 1f : 0.75f); 
@@ -824,51 +850,72 @@ namespace ThatsLit
             if (ThatsLitPlugin.EnableMovementImpact.Value)
             {
                 if (__instance.Owner.Mover.Sprinting)
-                    __result *= 1 + (rand2 / (3f - caution * 0.1f)) * Mathf.InverseLerp(30f, 75f, visionAngleDelta); // When facing away (30~75deg), sprinting bots takes up to 33% longer to spot the player
+                    seenSec *= 1 + (rand2 / (3f - caution * 0.1f)) * Mathf.InverseLerp(30f, 75f, visionAngleDelta); // When facing away (30~75deg), sprinting bots takes up to 33% longer to spot the player
                 else if (!__instance.Owner.Mover.IsMoving)
                 {
-                    float delta = __result * (rand4 / (5f + caution * 0.1f)); // When not moving, bots takes up to 20% shorter to spot the player
-                    __result -= delta;
+                    float delta = seenSec * (rand4 / (5f + caution * 0.1f)); // When not moving, bots takes up to 20% shorter to spot the player
+                    seenSec -= delta;
                 }
 
                 if (pSpeedFactor > 0.01f)
                 {
-                    float delta = __result * (rand2 / (5f + caution * 0.1f)) * pSpeedFactor * (1f - extremeDarkFactor) * Mathf.Clamp01(pPoseFactor); // When the score is -0.7+, bots takes up to 20% shorter to spot the player according to player movement speed (when not proning);
-                    __result -= delta;
+                    float delta = seenSec * (rand2 / (5f + caution * 0.1f)) * pSpeedFactor * (1f - extremeDarkFactor) * Mathf.Clamp01(pPoseFactor); // When the score is -0.7+, bots takes up to 20% shorter to spot the player according to player movement speed (when not proning);
+                    seenSec -= delta;
                 }
             }
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo5 = __result;
+                player.DebugInfo.lastCalcTo5 = seenSec;
             }
             // ===== Visible Parts
             // Simulate the situation where part of a player is seen but the bot failed to recognize it due to the lack of full view
             var visibleParts = 6f; // Starts at 6 in case all parts are not alawys checked
             var upperVisible = 4;
-            foreach (var p in __instance.AllActiveParts)
+            // The parts' LOS state is from the previous look tick (GetVisibilityChangeSpeedK runs before CalculatePartVisibility).
+            // Only read it when a consumer exists: Body Parts Recognition, or the flashlight reaction's upperVisible gate.
+            if (ThatsLitPlugin.EnableBodyPartsRecognition.Value
+             || (ThatsLitPlugin.EnableExtraFlashLightReaction.Value && canSeeLight && playerFC != null))
             {
-                if (!p.Value.LastVisibilityCastSucceed)
+                var allPartsVision = _allPartsVisionRef(__instance);
+                float occludedParts = 0f;
+                int occludedUpper = 0;
+                int partsWithLos = 0;
+                if (allPartsVision != null)
+                foreach (BodyPartType partType in __instance.AllActiveParts)
                 {
-                    switch (p.Key.BodyPartType)
+                    if (!allPartsVision.TryGetValue(partType, out var pv) || pv == null) continue;
+                    if (pv.HasLineOfSight)
+                    {
+                        partsWithLos++;
+                        continue;
+                    }
+                    switch (partType)
                     {
                         case BodyPartType.head:
-                            visibleParts -= 0.5f; // easier to recognize
-                            upperVisible--;
+                            occludedParts += 0.5f; // easier to recognize
+                            occludedUpper++;
                             break;
                         case BodyPartType.body:
-                            visibleParts -= 2.0f;
-                            upperVisible--;
+                            occludedParts += 2.0f;
+                            occludedUpper++;
                             break;
                         case BodyPartType.leftArm:
                         case BodyPartType.rightArm:
-                            visibleParts -= 1f;
-                            upperVisible--;
+                            occludedParts += 1f;
+                            occludedUpper++;
                             break;
                         default:
-                            visibleParts -= 1f;
+                            occludedParts += 1f;
                             break;
                     }
+                }
+                // No part had LOS on the previous tick => this is the first tick entering LOS and the per-part LOS data
+                // is stale (all false). Don't penalize it as "fully occluded".
+                if (partsWithLos > 0)
+                {
+                    visibleParts -= occludedParts;
+                    upperVisible -= occludedUpper;
                 }
             }
             if (ThatsLitPlugin.EnableBodyPartsRecognition.Value)
@@ -882,8 +929,8 @@ namespace ThatsLit
                 invisiblePartsFactor *= Mathf.InverseLerp(0f, 45f - caution, visionAngleDelta) * notSeenRecentAndNear * Mathf.InverseLerp(0f, 10f, zoomedDis);
                 if (botImpactType != BotImpactType.DEFAULT)
                     invisiblePartsFactor /= 2f;
-                __result += (0.04f * rand2) * invisiblePartsFactor;
-                __result *= 1f + (0.15f + 0.85f * rand1) * invisiblePartsFactor * 9f;
+                seenSec += (0.04f * rand2) * invisiblePartsFactor;
+                seenSec *= 1f + (0.15f + 0.85f * rand1) * invisiblePartsFactor * 9f;
             }
 
             float lastSeenGoalEnemyTime = Time.time - __instance.Owner?.Memory?.GoalEnemy?.TimeLastSeen ?? 0;
@@ -902,7 +949,7 @@ namespace ThatsLit
                 lutLookup2 = Mathf.Clamp(lutLookup2, 0, 45f);
                 simFreeLookDir = simFreeLookDir.RotateAroundPivot(Vector3.up, new Vector3(0f, lutLookup1));
                 simFreeLookDir = simFreeLookDir.RotateAroundPivot(Vector3.Cross(Vector3.up, botVisionDir), new Vector3(0f, -lutLookup2));
-                if (playerFC?.IsAiming == true)
+                if (botFC?.IsAiming == true)
                 {
                     simFreeLookDir = new Vector3(
                         Mathf.Lerp(simFreeLookDir.x, botVisionDir.x, 0.5f),
@@ -918,7 +965,7 @@ namespace ThatsLit
                 }
                 var simFocusDeltaFactor = Mathf.InverseLerp(0, 120f, Vector3.Angle(botVisionDir, simFreeLookDir));
                 simFocusDeltaFactor -= 0.5f;
-                __result *= 1f + (0.3f + rand1 * 0.2f) * notSeenRecentAndNear * simFocusDeltaFactor * Mathf.InverseLerp(2f, 6f, lastSeenGoalEnemyTime);
+                seenSec *= 1f + (0.3f + rand1 * 0.2f) * notSeenRecentAndNear * simFocusDeltaFactor * Mathf.InverseLerp(2f, 6f, lastSeenGoalEnemyTime);
                 if (player.DebugInfo != null && nearestAI)
                 {
                     player.DebugInfo.lastNearestFocusAngleX = lutLookup1;
@@ -926,29 +973,29 @@ namespace ThatsLit
                 }
             }
 
-            __result = Mathf.Lerp(__result, original, botImpactType == BotImpactType.DEFAULT? 0f : 0.5f);
+            seenSec = Mathf.Lerp(seenSec, original, botImpactType == BotImpactType.DEFAULT? 0f : 0.5f);
             
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo6 = __result;
+                player.DebugInfo.lastCalcTo6 = seenSec;
             }
 
-            if (__result > original) // That's Lit delaying the bot
+            if (seenSec > original) // That's Lit delaying the bot
             {
                 // In ~0.2s after being seen, stealth is nullfied (fading between 0.1~0.2)
                 // To prevent interruption of ongoing fight
                 float nullification = 1f - sinceSeen / 0.2f; // 0.1s => 50%, 0.2s => 0%
                 nullification *= rand5;
                 nullification -= deNullification; // Allow features to interrupt the nullification
-                __result = Mathf.Lerp(__result, original, Mathf.Clamp01(nullification)); // just seen (0s) => original, 0.1s => modified
+                seenSec = Mathf.Lerp(seenSec, original, Mathf.Clamp01(nullification)); // just seen (0s) => original, 0.1s => modified
 
                 // Cutoff from directly facing at shooting player
-                __result *= 1f - 0.5f * facingShotFactor * Mathf.InverseLerp(-0.45f, 0.45f, factor);
+                seenSec *= 1f - 0.5f * facingShotFactor * Mathf.InverseLerp(-0.45f, 0.45f, factor);
 
                 if (playerFC?.IsStationaryWeapon == true)
                 {
-                    __result *= 1f - 0.3f * rand4 * Mathf.InverseLerp(30f, 5f, zoomedDis);
+                    seenSec *= 1f - 0.3f * rand4 * Mathf.InverseLerp(30f, 5f, zoomedDis);
                 }
             }
             // This probably will let bots stay unaffected until losing the visual.1s => modified
@@ -960,7 +1007,7 @@ namespace ThatsLit
                 {
                     if (wCoFacingAngle < 7.5f) // Shining against the bot
                     {
-                        __result *= 1 - 0.75f * Mathf.InverseLerp(7.5f, 0f, wCoFacingAngle) * Mathf.InverseLerp(40f, 7.5f, zoomedDis);
+                        seenSec *= 1 - 0.75f * Mathf.InverseLerp(7.5f, 0f, wCoFacingAngle) * Mathf.InverseLerp(40f, 7.5f, zoomedDis);
                         // if (player.DebugInfo != null)
                         // {
                         //     player.DebugInfo.flashLightHint++;
@@ -968,7 +1015,7 @@ namespace ThatsLit
                     }
                     else if (nearestAI && dis < 15f) // Shining toward somewhere else but close enough
                     {
-                        __result *= 1 - rand4 * 0.4f * Mathf.InverseLerp(15, 1f, dis) * Mathf.InverseLerp(90f, 0f, Vector3.Angle(-playerFC.WeaponDirection, botVisionDir));
+                        seenSec *= 1 - rand4 * 0.4f * Mathf.InverseLerp(15, 1f, dis) * Mathf.InverseLerp(90f, 0f, Vector3.Angle(-playerFC.WeaponDirection, botVisionDir));
                         if (player.DebugInfo != null)
                         {
                             player.DebugInfo.flashLightHint++;
@@ -981,7 +1028,7 @@ namespace ThatsLit
             float sniperHintChance = pPoseFactor * 0.2f * Mathf.InverseLerp(1f, 0f, player.OverheadHaxRatingFactor) * Mathf.InverseLerp(1f, 0f, insideTime) * Mathf.InverseLerp(250f, 25f, zoomedDis) * Mathf.InverseLerp(15f, 1f, visionAngleDeltaHorizontal) * Mathf.InverseLerp(1f, 0f, botVelocity) * Mathf.InverseLerp(5, 30f, eyeToPlayerBody.y);
             if (rand3 < sniperHintChance)
             {
-                __result = Mathf.Min(__result, 1f);
+                seenSec = Mathf.Min(seenSec, 1f);
                 if (player.DebugInfo != null)
                 {
                     player.DebugInfo.sniperHintOffset = eyeToPlayerBody;
@@ -989,9 +1036,9 @@ namespace ThatsLit
                 }
             }
 
-            if (ShouldLogSeenCoef())
+            if (shouldLogSeenCoef)
             {
-                player.DebugInfo.lastCalcTo7 = __result;
+                player.DebugInfo.lastCalcTo7 = seenSec;
             }
             // if (nearestAI
             //  && canSeeLight
@@ -1002,7 +1049,7 @@ namespace ThatsLit
             //  && Vector3.Angle(botVisionDir, player.flashLightHit.point - __instance.Owner.MyHead.position) < 90f
             //  && !Physics.Raycast(__instance.Owner.MyHead.position, player.flashLightHit.point, (player.flashLightHit.point - __instance.Owner.MyHead.position).magnitude - 0.05f, ThatsLitPlayer.ambienceRaycastMask))
             // {
-            //     __result = Mathf.Lerp(__result, 0.5f * original, rand5 * Mathf.InverseLerp(15, 2f, dis) * Mathf.InverseLerp(0.25f, -0.5f, score) );
+            //     seenSec = Mathf.Lerp(seenSec, 0.5f * original, rand5 * Mathf.InverseLerp(15, 2f, dis) * Mathf.InverseLerp(0.25f, -0.5f, score) );
             //     if (player.DebugInfo != null)
             //     {
             //         player.DebugInfo.flashLightHint++;
@@ -1010,22 +1057,38 @@ namespace ThatsLit
             // }
 
             // Up to 50% penalty
-            if (__result < 0.5f * original)
+            if (seenSec < 0.5f * original)
             {
-                __result = 0.5f * original;
+                seenSec = 0.5f * original;
             }
 
-            __result = Mathf.Lerp(original, __result, __result < original ? ThatsLitPlugin.FinalImpactScaleFastening.Value : ThatsLitPlugin.FinalImpactScaleDelaying.Value);
+            seenSec = Mathf.Lerp(original, seenSec, seenSec < original ? ThatsLitPlugin.FinalImpactScaleFastening.Value : ThatsLitPlugin.FinalImpactScaleDelaying.Value);
 
-            __result += ThatsLitPlugin.FinalOffset.Value;
-            if (__result < 0.005f)
-                __result = 0.005f;
+            seenSec += ThatsLitPlugin.FinalOffset.Value;
+            if (seenSec < 0.005f)
+                seenSec = 0.005f;
+
+            // Back to the speed domain (use double to avoid float32 overflow to Infinity).
+            // Per-part threshold emulation runs inside PartVisionThresholdPatch (EnemyPartVision.UpdateVisibility)
+            // AFTER CheckLineOfSight has applied each part's _greenK, so parts never bleed VisibilityDuration
+            // across each other and _greenK is applied exactly once.
+            if (seenSec > 1e-5f && !float.IsNaN(seenSec) && !float.IsInfinity(seenSec))
+            {
+                double kOut = 1.0 / ((double)seenSec * (double)vcs);
+                if (kOut > 0.0 && kOut <= float.MaxValue && !double.IsNaN(kOut) && !double.IsInfinity(kOut))
+                {
+                    __result = (float)kOut;
+                    _lastThresholdBot = __instance.Owner;
+                    _lastThresholdFrame = Time.frameCount;
+                    _lastThresholdVcs = vcs;
+                }
+            }
 
             if (player.DebugInfo != null)
             {
-                if (ShouldLogSeenCoef())
+                if (shouldLogSeenCoef)
                 {
-                    player.DebugInfo.lastCalcTo8 = __result;
+                    player.DebugInfo.lastCalcTo8 = seenSec;
                     player.DebugInfo.lastFactor2 = factor;
                     player.DebugInfo.rawTerrainScoreSample = detailScoreRaw;
                 }
@@ -1036,13 +1099,6 @@ namespace ThatsLit
 
             ThatsLitPlugin.swSeenCoef.Stop();
 
-            bool ShouldLogSeenCoef()
-            {
-                return player.DebugInfo != null
-                    && nearestAI
-                    && (!__instance.IsVisible
-                    || Time.frameCount % ThatsLitPlayer.DEBUG_INTERVAL == ThatsLitPlayer.DEBUG_INTERVAL - 1);
-            }
         }
 
 
@@ -1059,4 +1115,57 @@ namespace ThatsLit
             new float[] { -63f, 60f, -39f, -78f, -60f, -15f, -48f, 84f, -3f, -30f, -33f, 54f, 30f, 9f, -12f, -66f, -18f, 33f, -69f, 87f, 36f, -6f, 66f, 48f, 78f, 72f, 45f, -27f, -87f, -45f, 81f, 90f, 18f, 57f, 75f, -36f, 15f, -84f, 12f, -42f, 39f, -9f, -75f, -81f, 51f, -21f, 21f, 69f, 3f, 27f, -54f, -90f, 24f, -51f, 42f, -24f, -57f, 63f, 0f, -72f, 6f, },        };
     }
 
+
+    /// <summary>
+    /// Applies EFT 0.15 (That's Lit 3.10) threshold spotting semantics per body part inside EnemyPartVision.UpdateVisibility,
+    /// AFTER EnemyPartVision.CheckLineOfSight has multiplied visibilityChangeSpeedK by that part's _greenK.
+    /// Zero-allocation: matches the BotOwner and frame set by SeenCoefPatch on the immediately preceding GetVisibilityChangeSpeedK call.
+    /// </summary>
+    public class PartVisionThresholdPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod()
+        {
+            return AccessTools.Method(typeof(EnemyPartVision), nameof(EnemyPartVision.UpdateVisibility));
+        }
+
+        [PatchPrefix]
+        public static void PatchPrefix(EnemyPartVision __instance, BotOwner owner, bool onSence, bool onSenceGreen, float deltaTime, ref float visibilityChangeSpeedK)
+        {
+            if (!ThatsLitPlugin.EnabledMod.Value || owner == null
+             || !ReferenceEquals(owner, SeenCoefPatch._lastThresholdBot)
+             || Time.frameCount != SeenCoefPatch._lastThresholdFrame)
+                return;
+
+            if (!(__instance.HasLineOfSight || onSence || onSenceGreen))
+                return;
+
+            if (deltaTime <= 1e-4f || float.IsNaN(deltaTime) || float.IsInfinity(deltaTime))
+                return;
+
+            if (!(visibilityChangeSpeedK > 1e-6f) || float.IsNaN(visibilityChangeSpeedK) || float.IsInfinity(visibilityChangeSpeedK))
+                return;
+
+            double vcs = SeenCoefPatch._lastThresholdVcs;
+            if (!(vcs > 0.0)) vcs = 1.0;
+
+            double partSeenSec = 1.0 / ((double)visibilityChangeSpeedK * vcs);
+            if (double.IsNaN(partSeenSec) || double.IsInfinity(partSeenSec) || partSeenSec <= 1e-5)
+                return;
+
+            double partElapsed = (double)__instance.VisibilityDuration + (double)deltaTime;
+            double target = partElapsed >= partSeenSec ? 1.01 : Math.Min(0.999, partElapsed / partSeenSec);
+            double needed = Math.Max(target - (double)__instance.VisibilityLevel, 0.0);
+            double kAdjusted = needed / ((double)deltaTime * vcs);
+            if (kAdjusted >= 0.0 && kAdjusted <= float.MaxValue && !double.IsNaN(kAdjusted) && !double.IsInfinity(kAdjusted))
+                visibilityChangeSpeedK = (float)kAdjusted;
+        }
+
+        [PatchPostfix]
+        public static void PatchPostfix()
+        {
+            SeenCoefPatch._lastThresholdBot = null;
+            SeenCoefPatch._lastThresholdFrame = 0;
+            SeenCoefPatch._lastThresholdVcs = 0f;
+        }
+    }
 }

@@ -5,6 +5,7 @@ namespace ThatsLit
     {
         public bool casted;
         public string name;
+        internal DetailKind kind;
         public int count;
     }
 }

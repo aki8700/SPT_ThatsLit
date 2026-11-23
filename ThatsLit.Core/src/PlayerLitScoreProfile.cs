@@ -96,10 +96,88 @@ namespace ThatsLit
             return score;
         }
 
+        // Persistent pixel counting buffers, allocated lazily once and reused every readback
+        // (previously 3 TempJob NativeArrays were allocated + disposed per counted frame).
+        internal NativeArray<float> persistentThresholds;
+        internal NativeArray<int> persistentCounted;
+        internal NativeArray<float> persistentLum;
+        /// <summary>
+        /// True between StartCountPixels and the next CompleteCountPixels. Frames without a newly scheduled count read as
+        /// "nothing counted" (exactly what the former disposed-per-frame arrays produced: IsCreated == false).
+        /// </summary>
+        internal bool hasPendingCount;
+        internal struct CachedPixelSample
+        {
+            public int shine, high, highMid, mid, midLow, low, dark, valid;
+            public float lum, lumNonDark;
+            public bool hasSample;
+        }
+        internal readonly CachedPixelSample[] cachedAngleSamples = new CachedPixelSample[6];
+        internal int pendingCountAngleIndex;
+        internal int lastCompletedAngleIndex;
+        internal int cachedReadAngleIndex;
+        internal bool useCachedPixelsOnSkip;
+
+        internal void ClearCachedAngleSamples()
+        {
+            for (int i = 0; i < cachedAngleSamples.Length; i++)
+                cachedAngleSamples[i] = default;
+            pendingCountAngleIndex = 0;
+            lastCompletedAngleIndex = 0;
+            cachedReadAngleIndex = 0;
+            useCachedPixelsOnSkip = false;
+        }
+        static int[] zeroCounted;
+        static float[] zeroLum;
+
+        internal static int CountedLength => 8 * Unity.Jobs.LowLevel.Unsafe.JobsUtility.MaxJobThreadCount;
+        internal static int LumLength => 2 * Unity.Jobs.LowLevel.Unsafe.JobsUtility.MaxJobThreadCount;
+
+        /// <summary>
+        /// Complete any in-flight count, (lazily) allocate the persistent buffers and zero-clear counted/lum.
+        /// </summary>
+        internal void PrepareBuffers()
+        {
+            CountingJobHandle.Complete();
+            if (!persistentThresholds.IsCreated) persistentThresholds = new NativeArray<float>(6, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            if (!persistentCounted.IsCreated) persistentCounted = new NativeArray<int>(CountedLength, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            if (!persistentLum.IsCreated) persistentLum = new NativeArray<float>(LumLength, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            if (zeroCounted == null || zeroCounted.Length != persistentCounted.Length) zeroCounted = new int[persistentCounted.Length];
+            if (zeroLum == null || zeroLum.Length != persistentLum.Length) zeroLum = new float[persistentLum.Length];
+            NativeArray<int>.Copy(zeroCounted, persistentCounted); // memcpy of zeros, no managed allocation
+            NativeArray<float>.Copy(zeroLum, persistentLum);
+        }
+
+        /// <summary>
+        /// Complete any in-flight job and release the persistent buffers. Safe to call repeatedly.
+        /// </summary>
+        internal void DisposeBuffers()
+        {
+            CountingJobHandle.Complete();
+            hasPendingCount = false;
+            ClearCachedAngleSamples();
+            if (persistentThresholds.IsCreated) persistentThresholds.Dispose();
+            if (persistentCounted.IsCreated) persistentCounted.Dispose();
+            if (persistentLum.IsCreated) persistentLum.Dispose();
+            persistentThresholds = default;
+            persistentCounted = default;
+            persistentLum = default;
+            // The job struct holds copies of the (now freed) persistent arrays: drop them so nothing reads freed memory.
+            var job = PixelCountingJob;
+            job.tex = default; // Borrowed from ThatsLitPlayer; only that owner disposes it.
+            job.thresholds = default;
+            job.counted = default;
+            job.lum = default;
+            PixelCountingJob = job;
+        }
+
         public void Dispose()
         {
             CountingJobHandle.Complete();
-            PixelCountingJob.Dispose();
+            var job = PixelCountingJob;
+            job.tex = default;
+            PixelCountingJob = job;
+            DisposeBuffers();
         }
 
         public struct CountPixelsJob : IJobParallelFor, IDisposable
@@ -119,7 +197,6 @@ namespace ThatsLit
 
             public void Dispose()
             {
-                tex.Dispose();
                 counted.Dispose();
                 lum.Dispose();
                 thresholds.Dispose();
@@ -128,17 +205,21 @@ namespace ThatsLit
             public void Execute(int index)
             {
                 Color32 c = tex[index];
-                if (c == Color.white || c.a <= 0.5f)
+                // Exact byte equivalent of (c == Color.white || c.a <= 0.5f) without the Color32 -> Color conversion:
+                // Color == is approximate (sqr diff < 1e-10) but 8-bit channels differ by >= 1/255, so only RGBA 255 matches.
+                if (c.a == 0 || (c.r & c.g & c.b & c.a) == 255)
                     return;
 
-                var pxLum = (c.r + c.g + c.b) / 765f;
+                const float Inv765 = 1f / 765f;
+                var pxLum = (c.r + c.g + c.b) * Inv765;
 
                 int threadIndexOffset = threadIndex * 8;
-                lum[threadIndexOffset + 0] += pxLum;
+                int lumIndexOffset = threadIndex * 2;
+                lum[lumIndexOffset + 0] += pxLum;
                 if (pxLum < thresholds[5])
                 {
                     counted[threadIndexOffset + 6] += 1;
-                    lum[threadIndexOffset + 1] += pxLum;
+                    lum[lumIndexOffset + 1] += pxLum;
                 }
                 else if (pxLum >= thresholds[0]) counted[threadIndexOffset + 0] += 1;
                 else if (pxLum >= thresholds[1]) counted[threadIndexOffset + 1] += 1;

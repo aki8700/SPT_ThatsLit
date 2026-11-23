@@ -1,4 +1,4 @@
-#define DEBUG_DETAILS
+﻿#define DEBUG_DETAILS
 using SPT.Reflection.Patching;
 using HarmonyLib;
 using System.Reflection;
@@ -14,37 +14,58 @@ namespace ThatsLit
 {
     public class ExtraVisibleDistancePatch : ModulePatch
     {
-        internal static System.Diagnostics.Stopwatch _benchmarkSW;
 
         protected override MethodBase GetTargetMethod()
         {
-            return AccessTools.Method(typeof(EnemyInfo), "CheckVisibility");
+            // EFT 40743: CheckVisibility(part, ref addVisibility) is gone. The extra sensor distance is now
+            // computed once per enemy per look tick by GetAdditionalSensorDistance and added to VisibleDist
+            // in EnemyPartVision.CheckLineOfSight (VisibleDist + addSensorDistance < magnitude => no LOS).
+            return AccessTools.Method(typeof(EnemyInfo), nameof(EnemyInfo.GetAdditionalSensorDistance));
         }
 
-        [PatchPrefix]
-        [HarmonyAfter("me.sol.sain")]
-        public static bool PatchPrefix(EnemyInfo __instance, KeyValuePair<EnemyPart, EnemyPartData> part, ref float addVisibility)
+        [PatchPostfix]
+        // SAIN's patches are SPT ModulePatches whose Harmony id is the patch class name, so "me.sol.sain" alone never matched.
+        [HarmonyAfter("me.sol.sain", "VisionDistancePatch")]
+        public static void PatchPostfix(EnemyInfo __instance, ref float __result)
         {
+            if (__instance?.Owner?.LookSensor == null) return;
+            // Effective sensor distance as used by EnemyPartVision.CheckLineOfSight (VisibleDist + addSensorDistance).
+            // Vanilla returns 1 (or ENEMY_LIGHT_ADD); SAIN (VisionDistancePatch) adds visionDist - VisibleDist, so when SAIN
+            // rejects the enemy (outside its vision cone: modifier 0) the effective distance becomes exactly 1.
+            // Never resurrect a distance SAIN has rejected.
+            if (__instance.Person == null || __instance.Person.IsAI) return;
+            float vd = __instance.Owner.LookSensor.VisibleDist;
+            var look = __instance.Owner.Settings?.FileSettings?.Look;
+            float vanillaBase = (__instance.Person.AIData != null && __instance.Person.AIData.UsingLight && look != null && vd < look.ENEMY_LIGHT_START_DIST)
+                ? look.ENEMY_LIGHT_ADD
+                : 1f;
+            // Separate EFT's vanilla base (1 or ENEMY_LIGHT_ADD) so SAIN's -VisibleDist rejection is still caught when a flashlight is active.
+            if (vd + (__result - vanillaBase) <= 0.5f) return;
+            float effectiveDist = vd + __result;
+
             ThatsLitPlugin.swExtraVisDis.MaybeResume();
-            if (__instance?.Owner == null
-             || (part.Key?.Owner?.IsAI ?? true) == true
-             || !ThatsLitPlugin.EnabledMod.Value
+            if (!ThatsLitPlugin.EnabledMod.Value
              || ThatsLitPlugin.ExtraVisionDistanceScale.Value == 0
              || !ThatsLitPlugin.EnabledLighting.Value
              || ThatsLitPlugin.PMCOnlyMode.Value && !Utility.IsPMCSpawnType(__instance.Owner?.Profile?.Info?.Settings?.Role))
             {
                 ThatsLitPlugin.swExtraVisDis.Stop();
-                return true;
+                return;
             }
 
-            if (Singleton<ThatsLitGameworld>.Instance?.ScoreCalculator == null || __instance.Owner?.LookSensor == null) return true;
+            if (Singleton<ThatsLitGameworld>.Instance?.ScoreCalculator == null)
+            {
+                ThatsLitPlugin.swExtraVisDis.Stop();
+                return;
+            }
 
+            float addVisibility = 0f;
             ThatsLitPlayer player = null;
             Singleton<ThatsLitGameworld>.Instance?.AllThatsLitPlayers?.TryGetValue(__instance.Person, out player);
             if (player == null || player.PlayerLitScoreProfile == null)
             {
                 ThatsLitPlugin.swExtraVisDis.Stop();
-                return true;
+                return;
             }
 
 
@@ -70,13 +91,21 @@ namespace ThatsLit
                 NightVisionComponent.EMask? mask = botNVG.NightVisionItem?.Template?.Mask;
                 thermalActive = mask == EFT.InventoryLogic.NightVisionComponent.EMask.Thermal;
                 nvgActive = mask != null && mask != EFT.InventoryLogic.NightVisionComponent.EMask.Thermal;
+                if (thermalActive)
+                {
+                    string goggleId = botNVG.NightVisionItem?.Item?.StringTemplateId ?? string.Empty;
+                    if (ThatsLitCompat.Goggles.TryGetValue(goggleId, out var goggleCompat) && goggleCompat?.TemplateInstance?.thermal != null)
+                        thermalRange = goggleCompat.TemplateInstance.thermal.effectiveDistance;
+                    else
+                        thermalRange = 200f;
+                }
             }
             else
             {
                 EFT.InventoryLogic.SightComponent sightMod = __instance.Owner?.GetPlayer?.ProceduralWeaponAnimation?.CurrentAimingMod;
                 if (sightMod != null)
                 {
-                    ThatsLitCompat.Scopes.TryGetValue(sightMod.Item?.TemplateId, out var scopeCompat);
+                    ThatsLitCompat.Scopes.TryGetValue(sightMod.Item?.StringTemplateId ?? string.Empty, out var scopeCompat);
                     if (scopeCompat?.TemplateInstance?.thermal != null)
                     {
                         thermalActive = true;
@@ -87,11 +116,10 @@ namespace ThatsLit
                 }
             }
 
-            float fogFactor = EFT.Weather.WeatherController.Instance?.WeatherCurve?.Fog?? 0f;
-            fogFactor = Mathf.InverseLerp(0, 0.35f, fogFactor);
-            ScoreCalculator scoreCalculator = Singleton<ThatsLitGameworld>.Instance.ScoreCalculator;
             FrameStats frame0 = player.PlayerLitScoreProfile?.frame0 ?? default;
-            var originalDist = __instance.Owner.LookSensor.VisibleDist;
+            // Compensate from the effective (SAIN-scaled) distance, not the raw LookSensor distance: otherwise SAIN's scaling
+            // is counted twice, and SAIN's +1000 "always visible" naturally yields compensation <= 0 here.
+            float originalDist = effectiveDist;
             if (thermalActive)
             {
                 float compensation = thermalRange - originalDist;
@@ -101,6 +129,7 @@ namespace ThatsLit
             }
             else if (nvgActive && frame0.ambienceScore < 0) // Base + Sun/Moon < 0
             {
+                float fogFactor = Mathf.InverseLerp(0f, 0.35f, EFT.Weather.WeatherController.Instance?.WeatherCurve?.Fog ?? 0f);
                 float scale;
                 if (player.LightAndLaserState.IRLight)
                     scale = 3.5f;
@@ -123,6 +152,7 @@ namespace ThatsLit
             }
             else if (!nvgActive && frame0.ambienceScore > 0) // Base + Sun/Moon > 0
             {
+                float fogFactor = Mathf.InverseLerp(0f, 0.35f, EFT.Weather.WeatherController.Instance?.WeatherCurve?.Fog ?? 0f);
                 float compensation = __instance.Owner.Settings.FileSettings.Look.MIDDLE_DIST - originalDist;
                 if (compensation > 0)
                 {
@@ -135,6 +165,7 @@ namespace ThatsLit
             }
             else if (!nvgActive)
             {
+                float fogFactor = Mathf.InverseLerp(0f, 0.35f, EFT.Weather.WeatherController.Instance?.WeatherCurve?.Fog ?? 0f);
                 float litDiff = frame0.multiFrameLitScore - frame0.baseAmbienceScore; // The visibility provided by sun/moon + lightings
                 litDiff = Mathf.InverseLerp(0, 2, litDiff);
                 litDiff *= 1f - fogFactor;
@@ -142,16 +173,17 @@ namespace ThatsLit
                 float compensation = __instance.Owner.Settings.FileSettings.Look.MIDDLE_DIST - originalDist;
                 if (compensation > 0)
                 {
-                    compensation *= litDiff;
+                    compensation *= litDiff * ThatsLitPlugin.ExtraVisionDistanceScale.Value;
                     addVisibility += compensation;
                 }
                 if (isNearest && player.DebugInfo != null)
                     player.DebugInfo.lastDisComp = compensation;
             }
 
-            ThatsLitPlugin.swExtraVisDis.Stop();
+            if (addVisibility > 0f && !float.IsNaN(addVisibility) && !float.IsInfinity(addVisibility))
+                __result += addVisibility;
 
-            return true;
+            ThatsLitPlugin.swExtraVisDis.Stop();
         }
     }
 }

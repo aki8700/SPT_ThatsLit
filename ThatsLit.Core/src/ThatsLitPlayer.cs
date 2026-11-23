@@ -39,7 +39,6 @@ namespace ThatsLit
         public float fog, rain, cloud;
         AsyncGPUReadbackRequest gquReq;
         internal float lastOutside;
-        internal float surroundingRating;
         /// <summary>
         /// 0~10
         /// </summary>
@@ -58,34 +57,71 @@ namespace ThatsLit
         internal Vector3 lastShotVector;
         internal float lastShotTime;
         internal static readonly LayerMask ambienceRaycastMask = (1 << LayerMask.NameToLayer("Terrain")) | (1 << LayerMask.NameToLayer("HighPolyCollider")) | (1 << LayerMask.NameToLayer("Grass")) | (1 << LayerMask.NameToLayer("Foliage"));
-        internal delegate bool CheckStimEffectProxy (EFT.HealthSystem.EStimulatorBuffType buffType);
-        internal CheckStimEffectProxy CheckEffectDelegate
-        {
-            get
-            {
-                if (checkEffectDelegate == null)
-                {
-                    var methodInfo = ReflectionHelper.FindMethodByArgTypes(typeof(EFT.HealthSystem.ActiveHealthController), new Type[] { typeof(EFT.HealthSystem.EStimulatorBuffType) }, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-                    checkEffectDelegate = (CheckStimEffectProxy) methodInfo.CreateDelegate(typeof(CheckStimEffectProxy), Player.ActiveHealthController);
-                }
-                return checkEffectDelegate;
-            }
-        }
-        private CheckStimEffectProxy checkEffectDelegate;
+        // CheckEffectDelegate (reflection + CreateDelegate on Player.ActiveHealthController) was removed:
+        // Fika ObservedPlayer has no ActiveHealthController, which made CreateDelegate throw ArgumentException.
+        // Use Player?.ActiveHealthController?.HasStimulatorBuff(...) directly instead.
         static float canLoadTime = 0;
         internal RaycastHit flashLightHit;
         internal BotOwner lastNearest;
         ThatsLitGameworld gameworld;
         static Camera prefab;
-        int cameraThrottleFrequency = 1440;
+        int cameraThrottleFrequency = 1;
+        int _camAngleIndex;
+        int _renderedAngleIndex;
+        int _pendingReadbackAngle;
+        bool _hasUnreadRender;
+        float _lastCamRenderTime = -1000f;
+        float _lastWakeShotTime = -1f;
+        float _nextDebugCopyTime;
+        Vector3 _lastCamRenderPos;
+        float _lastCamRenderPose;
+        bool _lastCamRenderProne;
+        LightAndLaserState _lastCamRenderLights;
+        float _lastCamRenderShadow;
+        int _camWakeSweepRemaining = 6;
+        int _camWarmupRemaining = 6;
+
+        void ResetCameraCacheState()
+        {
+            _camAngleIndex = 0;
+            _renderedAngleIndex = 0;
+            _pendingReadbackAngle = 0;
+            _hasUnreadRender = false;
+            _lastCamRenderTime = -1000f;
+            _lastWakeShotTime = -1f;
+            _nextDebugCopyTime = 0f;
+            _camWakeSweepRemaining = 6;
+            _camWarmupRemaining = 6;
+            PlayerLitScoreProfile?.ClearCachedAngleSamples();
+        }
+
+        static bool LightsEqual(LightAndLaserState a, LightAndLaserState b)
+        {
+            return a.VisibleLight == b.VisibleLight
+                && a.VisibleLaser == b.VisibleLaser
+                && a.IRLight == b.IRLight
+                && a.IRLaser == b.IRLaser
+                && a.VisibleLightSub == b.VisibleLightSub
+                && a.VisibleLaserSub == b.VisibleLaserSub
+                && a.IRLightSub == b.IRLightSub
+                && a.IRLaserSub == b.IRLaserSub;
+        }
         public static bool CanLoad ()
         {
-            if (CameraClass.Instance.OpticCameraManager.Camera != null
+            // Headless (batchmode) never renders: no camera prefab is needed, and remote ObservedPlayers
+            // must still be set up so foliage / proxy brightness (from That's Lit Sync) apply to bots.
+            if (Application.isBatchMode) return true;
+
+            // Prefab already built: same result as the final return below, without re-traversing CameraManager every frame.
+            if (prefab != null) return canLoadTime + 10 < Time.realtimeSinceStartup;
+
+            Camera opticCamera = EFT.CameraControl.CameraManager.Instance?.OpticCameraManager?.Camera;
+            if (opticCamera != null
              && prefab == null)
             {
-                CameraClass.Instance.OpticCameraManager.Camera.gameObject.SetActive(false);
-                prefab = GameObject.Instantiate<Camera>(CameraClass.Instance.OpticCameraManager.Camera);
-                CameraClass.Instance.OpticCameraManager.Camera.gameObject.SetActive(true);
+                opticCamera.gameObject.SetActive(false);
+                prefab = GameObject.Instantiate<Camera>(opticCamera);
+                opticCamera.gameObject.SetActive(true);
                 prefab.gameObject.name = "That's Lit Camera (Prefab)";
                 foreach (var c in prefab.gameObject.GetComponents<MonoBehaviour>())
                 switch (c) {
@@ -105,7 +141,7 @@ namespace ThatsLit
                 prefab.nearClipPlane = 0.001f;
                 prefab.farClipPlane = 3.5f;
 
-                prefab.cullingMask = LayerMaskClass.PlayerMask;
+                prefab.cullingMask = LayersMaskController.PlayerMask;
                 prefab.fieldOfView = 44;
 
 
@@ -130,8 +166,9 @@ namespace ThatsLit
         internal void MaybeEnableBrightness ()
         {
             if (!ThatsLitPlugin.EnabledLighting.Value
-             || gameworld.ScoreCalculator == null // Disabled on the map?
-             || Application.isBatchMode)
+             || gameworld?.ScoreCalculator == null // Disabled on the map?
+             || Application.isBatchMode // No rendering on headless; scores arrive as proxy values (ThatsLitAPI.ToggleBrightnessProxyDirect)
+             || prefab == null)
                 return;
 
             if (PlayerLitScoreProfile == null) PlayerLitScoreProfile = new PlayerLitScoreProfile(this);
@@ -157,11 +194,21 @@ namespace ThatsLit
                 cam.gameObject.SetActive(true);
             }
             else cam.enabled = true;
+            ResetCameraCacheState();
 
 
-            if (Player.IsYourPlayer)
+            if (Player.IsYourPlayer && !_debugTextureSubscribed)
+            {
                 ThatsLitPlugin.DebugTexture.SettingChanged += HandleDebugTextureSettingChanged;
-            if (Player.IsYourPlayer && ThatsLitPlugin.DebugTexture.Value)
+                _debugTextureSubscribed = true;
+            }
+            if (!ThatsLitPlugin.DebugTexture.Value)
+            {
+                if (display) display.enabled = false;
+                return;
+            }
+            if (MonoBehaviourSingleton<GameUI>.Instance == null) return;
+            if (Player.IsYourPlayer)
             {
                 if (slowRT == null) slowRT = new Texture2D(RESOLUTION, RESOLUTION, TextureFormat.RGBA32, false);
                 if (display == null)
@@ -176,22 +223,81 @@ namespace ThatsLit
             }
         }
 
+        internal bool IsBrightnessProxyRequested { get; private set; }
+        // Tracks the DebugTexture.SettingChanged subscription so DisableBrightness() (called every frame while the mod is
+        // disabled) does not allocate a new delegate per frame for a no-op unsubscribe.
+        bool _debugTextureSubscribed;
+        void DisposeObserved()
+        {
+            PlayerLitScoreProfile?.CountingJobHandle.Complete();
+            if (observed.IsCreated) { observed.Dispose(); observed = default; }
+        }
         internal void DisableBrightness ()
         {
+            _readbackGeneration++;
+            DisposeObserved();
+            ResetCameraCacheState();
             if (cam) cam.enabled = false;
             if (display) display.enabled = false;
-            PlayerLitScoreProfile = null;
-            ThatsLitPlugin.DebugTexture.SettingChanged -= HandleDebugTextureSettingChanged;
+            if (!IsBrightnessProxyRequested)
+            {
+                PlayerLitScoreProfile?.DisposeBuffers();
+                PlayerLitScoreProfile = null;
+            }
+            if (_debugTextureSubscribed)
+            {
+                ThatsLitPlugin.DebugTexture.SettingChanged -= HandleDebugTextureSettingChanged;
+                _debugTextureSubscribed = false;
+            }
         }
         internal void ToggleBrightnessProxy (bool toggle)
         {
+            IsBrightnessProxyRequested = toggle;
             if (cam) cam.enabled = !toggle;
             if (display) display.enabled = !toggle;
             PlayerLitScoreProfile.IsProxy = toggle;
             if (toggle)
             {
+                _readbackGeneration++;
+                DisposeObserved();
+                ResetCameraCacheState();
+                PlayerLitScoreProfile.DisposeBuffers(); // A proxy never counts pixels locally
                 PlayerLitScoreProfile.frame0 = default;
+                PlayerLitScoreProfile.litScoreFactor = 0f;
             }
+        }
+
+        /// <summary>
+        /// Requested by That's Lit Sync for remote humans: terrain detail (grass) scores are received from the owning client
+        /// instead of being sampled locally (Fika Headless has no GPUI detail data). See <see cref="ThatsLitAPI.ToggleTerrainProxyDirect"/>.
+        /// </summary>
+        internal bool IsTerrainProxyRequested { get; private set; }
+        internal void ToggleTerrainProxy (bool toggle)
+        {
+            IsTerrainProxyRequested = toggle;
+            if (toggle)
+            {
+                if (TerrainDetails != null && !TerrainDetails.IsProxy)
+                    TerrainDetails = null; // Drop any locally sampled profile; a fresh proxy profile is created below / on demand
+                EnsureTerrainProxyProfile();
+            }
+            else if (TerrainDetails != null && TerrainDetails.IsProxy)
+            {
+                TerrainDetails = null; // Back to local sampling (re-created by Update when available)
+            }
+        }
+
+        /// <summary>
+        /// Create the proxy terrain profile if requested and the grass module is usable on this map. Works in batchmode.
+        /// </summary>
+        internal bool EnsureTerrainProxyProfile ()
+        {
+            if (!IsTerrainProxyRequested) return false;
+            if (TerrainDetails != null) return TerrainDetails.IsProxy;
+            if (!ThatsLitPlugin.EnabledGrasses.Value || gameworld == null || gameworld.terrainDetailsUnavailable)
+                return false;
+            TerrainDetails = new PlayerTerrainDetailsProfile() { IsProxy = true };
+            return true;
         }
 
         private void Update()
@@ -214,18 +320,27 @@ namespace ThatsLit
             #endregion
 
 
-            Vector3 bodyPos = Player.MainParts[BodyPartType.body].Position;
+            if (Player.MainParts == null || !Player.MainParts.TryGetValue(BodyPartType.body, out var bodyPart) || bodyPart == null)
+            {
+                ThatsLitPlugin.swUpdate.Stop();
+                return;
+            }
+            Vector3 bodyPos = bodyPart.Position;
+            if ((!ThatsLitPlugin.EnabledGrasses.Value || gameworld.terrainDetailsUnavailable) && !IsTerrainProxyRequested) TerrainDetails = null;
+            if (!ThatsLitPlugin.EnabledFoliage.Value) Foliage = null;
+            if (!ThatsLitPlugin.EnableEquipmentCheck.Value) LightAndLaserState = default;
 
             if (!Player.AIData.IsInside)
                 lastOutside = Time.time;
 
-            if (EnvironmentManager.Instance.InBunker && lastOutBunkerTime >= lastInBunkerTime)
+            bool inBunker = EnvironmentManager.Instance?.InBunker == true;
+            if (inBunker && lastOutBunkerTime >= lastInBunkerTime)
             {
                 lastInBunkerTime = Time.time;
                 lastInBunderPos = bodyPos;
             }
 
-            if (!EnvironmentManager.Instance.InBunker && lastOutBunkerTime < lastInBunkerTime)
+            if (!inBunker && lastOutBunkerTime < lastInBunkerTime)
             {
                 lastOutBunkerTime = Time.time;
             }
@@ -237,7 +352,12 @@ namespace ThatsLit
             bunkerTimeClamped = Mathf.Clamp(bunkerTimeClamped, 0, 10);
 
             ThatsLitPlugin.swTerrain.MaybeResume();
-            if (ThatsLitPlugin.EnabledGrasses.Value
+            if (IsTerrainProxyRequested)
+            {
+                // Remote scores only (also on headless/batchmode): never sampled locally, never nulled here.
+                if (TerrainDetails == null) EnsureTerrainProxyProfile();
+            }
+            else if (ThatsLitPlugin.EnabledGrasses.Value
                 && !gameworld.terrainDetailsUnavailable
                 && TerrainDetails == null
                 && !Application.isBatchMode)
@@ -246,26 +366,28 @@ namespace ThatsLit
             }
 
             if (TerrainDetails != null
+            && !TerrainDetails.IsProxy
             && Time.time > TerrainDetails.LastCheckedTime + 0.41f)
             {
                 gameworld.CheckTerrainDetails(bodyPos, TerrainDetails);
+                if (gameworld.terrainDetailsUnavailable && !IsTerrainProxyRequested) TerrainDetails = null;
                 ThatsLitAPI.OnPlayerSurroundingTerrainSampledDirect?.Invoke(this);
                 ThatsLitAPI.OnPlayerSurroundingTerrainSampled?.Invoke(this.Player);
-                if (ThatsLitPlugin.TerrainInfo.Value)
+                if (ThatsLitPlugin.TerrainInfo.Value && TerrainDetails != null)
                 {
                     var score = gameworld.CalculateDetailScore(TerrainDetails, Vector3.zero, 0, 0);
                     terrainScoreHintProne = score.prone;
-                    var pf = Utility.GetPoseFactor(Player.PoseLevel, Player.Physical.MaxPoseLevel, Player.IsInPronePose);
+                    var pf = Utility.GetPoseFactor(Player.PoseLevel, (Player.Physical != null && Player.Physical.MaxPoseLevel > 0f ? Player.Physical.MaxPoseLevel : 1f), Player.IsInPronePose);
                     terrainScoreHintRegular = Utility.GetPoseWeightedRegularTerrainScore(pf, score);
                 }
             }
             ThatsLitPlugin.swTerrain.Stop();
 
             ThatsLitPlugin.swFoliage.MaybeResume();
+            // Foliage only uses Physics.OverlapSphereNonAlloc (no GPU), so it also runs on headless.
             if (ThatsLitPlugin.EnabledFoliage.Value
              && !gameworld.foliageUnavailable
-             && Foliage == null
-             && !Application.isBatchMode)
+             && Foliage == null)
             {
                 Foliage = new PlayerFoliageProfile(new FoliageInfo[16], new Collider[16]);
             }
@@ -278,8 +400,7 @@ namespace ThatsLit
             ThatsLitPlugin.swFoliage.Stop();
 
             if (ThatsLitPlugin.EnableEquipmentCheck.Value
-             && Time.time > lastCheckedLights + 0.41f
-             && PlayerLitScoreProfile != null)
+             && Time.time > lastCheckedLights + 0.41f)
             {
                 lastCheckedLights = Time.time;
                 var state = LightAndLaserState;
@@ -312,7 +433,8 @@ namespace ThatsLit
                 return;
             }
 
-            if (PlayerLitScoreProfile == null || PlayerLitScoreProfile.IsProxy || gameworld?.ScoreCalculator == null)
+            if (PlayerLitScoreProfile == null || PlayerLitScoreProfile.IsProxy || gameworld?.ScoreCalculator == null
+             || cam == null || Application.isBatchMode) // a non-proxy profile without a camera (e.g. headless) has nothing to render
             {
                 ThatsLitPlugin.swUpdate.Stop();
                 return;
@@ -321,54 +443,112 @@ namespace ThatsLit
             // ! Consdier this the box of all Brightness required statements
             // Remember that proxies also have a PlayerLitScoreProfile
 
-            if (ThatsLitPlugin.EnabledLighting.Value && !cam.enabled && (ThatsLitPlugin.EnabledCameraThrottling.Value == false || Time.frameCount % cameraThrottleFrequency == 0))
-            {
-                cam.enabled = true;
-                cameraThrottleFrequency = (int) (1f/Time.deltaTime);
-                cameraThrottleFrequency = Mathf.Max(cameraThrottleFrequency, 1);
-                cameraThrottleFrequency = (int) Mathf.Lerp(cameraThrottleFrequency, 1, Mathf.InverseLerp(0.35f, -0.1f, PlayerLitScoreProfile.frame0.ambienceScore));
-            }
-            else if (ThatsLitPlugin.EnabledCameraThrottling.Value && (cameraThrottleFrequency == 1 || Time.frameCount % cameraThrottleFrequency != 0))
-            {
-                if (cam.enabled)
-                {
-                    cameraThrottleFrequency = (int) (1f/Time.deltaTime);
-                    cameraThrottleFrequency = Mathf.Max(cameraThrottleFrequency, 1);
-                    cameraThrottleFrequency = (int) Mathf.Lerp(cameraThrottleFrequency, 1, Mathf.InverseLerp(0.35f, -0.1f, PlayerLitScoreProfile.frame0.ambienceScore));
-                    if (cameraThrottleFrequency > 4)
-                        cam.enabled = false;
-                }
-            }
-
+            // 1. Always read back the previously rendered frame before deciding whether to render again.
             if (gquReq.done && rt != null)
             {
-                if (cam?.enabled == false)
+                if (_hasUnreadRender)
                 {
-                    observed.Dispose();
-                }
-                else
-                {
-                    gquReq = AsyncGPUReadback.Request(rt, 0, req =>
+                    _hasUnreadRender = false;
+                    if (ThatsLitPlugin.DebugTexture.Value
+                        && display?.enabled == true
+                        && slowRT != null
+                        && Time.time >= _nextDebugCopyTime)
                     {
-                        observed.Dispose();
-                        if (!req.hasError)
-                        {
-                            ThatsLitPlugin.swScoreCalc.MaybeResume();
-                            observed = req.GetData<Color32>();
-                                gameworld?.ScoreCalculator?.PreCalculate(PlayerLitScoreProfile, observed, Utility.GetInGameDayTime());
-                            ThatsLitPlugin.swScoreCalc.Stop();
-                        }
-                    });
+                        Graphics.CopyTexture(rt, slowRT);
+                        _nextDebugCopyTime = Time.time + 0.5f;
+                    }
+                    if (_readbackCallback == null) _readbackCallback = OnReadbackComplete;
+                    _pendingReadbackGen = _readbackGeneration;
+                    _pendingReadbackAngle = _renderedAngleIndex;
+                    gquReq = AsyncGPUReadback.Request(rt, 0, _readbackCallback);
+                }
+                else if (cam?.enabled == false)
+                {
+                    DisposeObserved();
                 }
             }
 
-            if (cam?.enabled == true)
+            // 2. Dynamic 6-angle camera scheduling: reuse cached 6-angle pixel counts on skipped frames
+            //    so darkness/indoor CPU culling drops dramatically with zero stealth fidelity loss.
+            bool useThrottling = ThatsLitPlugin.EnabledCameraThrottling.Value;
+            bool shouldRender = false;
+
+            if (ThatsLitPlugin.EnabledLighting.Value)
             {
-                var camPos = Time.frameCount % 6;
+                bool moved = (bodyPos - _lastCamRenderPos).sqrMagnitude > 0.0225f; // > 0.15m
+                bool poseChanged = Player.IsInPronePose != _lastCamRenderProne
+                    || Mathf.Abs(Player.PoseLevel - _lastCamRenderPose) > 0.05f;
+                bool lightsChanged = !LightsEqual(LightAndLaserState, _lastCamRenderLights);
+                bool newShot = lastShotTime > 0f && lastShotTime != _lastWakeShotTime;
+                bool shadowChanged = Mathf.Abs(ambienceShadownRating - _lastCamRenderShadow) > 0.5f;
+
+                bool anyWake = moved || poseChanged || lightsChanged || newShot || shadowChanged;
+                if (anyWake)
+                {
+                    _camWakeSweepRemaining = 6;
+                }
+
+                bool readbackSlotFree = !_hasUnreadRender || gquReq.done;
+                if (!useThrottling)
+                {
+                    shouldRender = readbackSlotFree;
+                }
+                else if (readbackSlotFree)
+                {
+                    int maxHz = ThatsLitPlugin.CameraMaxRateHz.Value;
+                    int rawIdleHz = Mathf.Max(1, ThatsLitPlugin.CameraIdleRateHz.Value);
+                    int idleHz = maxHz > 0 ? Mathf.Min(rawIdleHz, maxHz) : rawIdleHz;
+                    float minInterval = maxHz > 0 ? 1f / maxHz : 0f;
+
+                    float brightFactor = Mathf.InverseLerp(-0.1f, 0.35f, PlayerLitScoreProfile.frame0.ambienceScore);
+                    float interval;
+                    if (_camWarmupRemaining > 0 || _camWakeSweepRemaining > 0)
+                    {
+                        // Complete the full 6-angle warmup or wake sweep at CameraMaxRateHz without bright-daylight stalls.
+                        interval = minInterval;
+                    }
+                    else if (brightFactor >= 0.99f)
+                    {
+                        interval = Mathf.Max(minInterval, 1.0f);
+                    }
+                    else
+                    {
+                        float idleInterval = 1f / idleHz;
+                        interval = Mathf.Lerp(idleInterval, Mathf.Max(idleInterval, 1.0f), brightFactor * brightFactor);
+                    }
+
+                    cameraThrottleFrequency = interval <= 0f ? 1 : Mathf.Max(1, Mathf.RoundToInt(interval / Mathf.Max(Time.deltaTime, 0.001f)));
+                    if (Time.time >= _lastCamRenderTime + interval)
+                    {
+                        shouldRender = true;
+                    }
+                }
+            }
+
+            PlayerLitScoreProfile.useCachedPixelsOnSkip = useThrottling && ThatsLitPlugin.EnabledLighting.Value;
+            cam.enabled = shouldRender;
+
+            if (shouldRender)
+            {
                 var camHeight = Player.IsInPronePose ? 0.45f : 2.2f * (0.6f + 0.4f * Player.PoseLevel);
                 var targetHeight = Player.IsInPronePose ? 0.2f : 0.7f;
                 var horizontalScale = Player.IsInPronePose ? 1.2f : 0.8f;
-                switch (Time.frameCount % 6)
+                int angle = _camAngleIndex;
+                _renderedAngleIndex = angle;
+                _camAngleIndex = (angle + 1) % 6;
+                _hasUnreadRender = true;
+
+                _lastCamRenderTime = Time.time;
+                _lastCamRenderPos = bodyPos;
+                _lastCamRenderPose = Player.PoseLevel;
+                _lastCamRenderProne = Player.IsInPronePose;
+                _lastCamRenderLights = LightAndLaserState;
+                _lastCamRenderShadow = ambienceShadownRating;
+                if (lastShotTime > 0f) _lastWakeShotTime = lastShotTime;
+                if (_camWarmupRemaining > 0) _camWarmupRemaining--;
+                if (_camWakeSweepRemaining > 0) _camWakeSweepRemaining--;
+
+                switch (angle)
                 {
                     case 0:
                         {
@@ -424,53 +604,30 @@ namespace ThatsLit
                         }
                 }
 
-                if (ThatsLitPlugin.DebugTexture.Value && Time.frameCount % 61 == 0 && display?.enabled == true && rt != null)
-                    Graphics.CopyTexture(rt, slowRT);
             }
             
             // Ambient shadow
             // Not required for proxies
-            Vector3 headPos = Player.MainParts[BodyPartType.head].Position;
-            Vector3 lhPos = Player.MainParts[BodyPartType.leftArm].Position;
-            Vector3 rhPos = Player.MainParts[BodyPartType.rightArm].Position;
-            Vector3 lPos = Player.MainParts[BodyPartType.leftLeg].Position;
-            Vector3 rPos = Player.MainParts[BodyPartType.rightLeg].Position;
+            // Only the body part sampled this frame (Time.frameCount % 5) is read; the other 4 lookups were unused.
+            int ambienceSlice = Time.frameCount % 5;
+            BodyPartType ambiencePart = ambienceSlice switch
+            {
+                0 => BodyPartType.head,
+                1 => BodyPartType.leftLeg,
+                2 => BodyPartType.rightLeg,
+                3 => BodyPartType.leftArm,
+                _ => BodyPartType.rightArm,
+            };
+            Vector3 ambiencePartPos = Player.MainParts[ambiencePart].Position;
             if (TOD_Sky.Instance != null)
             {
                 Ray ray = default;
-                float? sunlightFactor = gameworld.ScoreCalculator?.CalculateSunLightTimeFactor(ActiveRaidSettings.LocationId, Utility.GetInGameDayTime());
+                float? sunlightFactor = gameworld.ScoreCalculator?.CalculateSunLightTimeFactor(gameworld.LocationId, Utility.GetInGameDayTime());
                 if (sunlightFactor == null)
                     sunlightFactor = TOD_Sky.Instance.IsDay ? 1f : 0f;
                 Vector3 ambienceDir = sunlightFactor > 0.05f ? TOD_Sky.Instance.LocalSunDirection : TOD_Sky.Instance.LightDirection;
 
-                switch (Time.frameCount % 5)
-                {
-                    case 0:
-                        {
-                            ray = new Ray(headPos, ambienceDir);
-                            break;
-                        }
-                    case 1:
-                        {
-                            ray = new Ray(lPos, ambienceDir);
-                            break;
-                        }
-                    case 2:
-                        {
-                            ray = new Ray(rPos, ambienceDir);
-                            break;
-                        }
-                    case 3:
-                        {
-                            ray = new Ray(lhPos, ambienceDir);
-                            break;
-                        }
-                    case 4:
-                        {
-                            ray = new Ray(rhPos, ambienceDir);
-                            break;
-                        }
-                }
+                ray = new Ray(ambiencePartPos, ambienceDir);
 
                 var casted1 = RaycastIgnoreGlass(ray, 2000, ambienceRaycastMask, out var highPolyHit, out var lastPenetrated); // Anything high poly that is not glass
 
@@ -537,7 +694,12 @@ namespace ThatsLit
                 return;
             }
 
-            Player nearestBotPlayer = lastNearest?.GetPlayer;
+            if (lastNearest == null || lastNearest.IsDead)
+            {
+                ThatsLitPlugin.swFUpdate.Stop();
+                return;
+            }
+            Player nearestBotPlayer = lastNearest.GetPlayer;
             if (ThatsLitPlugin.EnableNearestBotSteering.Value
              && nearestBotPlayer != null
              && nearestBotPlayer.isActiveAndEnabled
@@ -551,7 +713,7 @@ namespace ThatsLit
                 ThatsLitGameworld.SingleIdThrottler throttler;
                 gameworld.singleIdThrottlers.TryGetValue(lastNearest.ProfileId, out throttler);
 
-                if (nearestBotGoalEnemy?.Person == Player
+                if (ReferenceEquals(nearestBotGoalEnemy?.Person, Player)
                  && nearestBotGoalEnemy?.HaveSeen == true
                  && Time.time - throttler.lastForceLook > 1f
                  && lastNearest.Mover.IsMoving == true && nearestBotPlayer.IsSprintEnabled == false
@@ -569,7 +731,7 @@ namespace ThatsLit
                     return;
                 }
 
-                if (nearestBotGoalEnemy?.Person == Player
+                if (ReferenceEquals(nearestBotGoalEnemy?.Person, Player)
                  && nearestBotGoalEnemy?.HaveSeen == true
                  && Time.time - nearestBotGoalEnemy.TimeLastSeen < 10f
                  && lastNearest.Mover.IsMoving == true && !nearestBotPlayer.IsSprintEnabled
@@ -605,8 +767,7 @@ namespace ThatsLit
                 Vector3 botHeadPos = nearestBotPlayer.MainParts[BodyPartType.head].Position;
                 if (flashLightHit.collider != null
                  && Time.time - throttler.lastForceLook > 1f
-                 && botHeadPos != null
-                 && (nearestBotGoalEnemy?.Person == Player || nearestBotGoalEnemy == null)
+                 && (ReferenceEquals(nearestBotGoalEnemy?.Person, Player) || nearestBotGoalEnemy == null)
                 //  && lastNearest.Steering.SteeringMode == EBotSteering.ToMovingDirection
                  && Vector3.Angle(lastNearest.LookDirection, flashLightHit.normal) > 90f
                  && Vector3.Angle(lastNearest.LookDirection, flashLightHit.point - botHeadPos) < 90f
@@ -629,10 +790,12 @@ namespace ThatsLit
 
         IEnumerator MakeBotPeekSide (BotOwner bot)
         {
+            if (bot == null || bot.IsDead) yield break;
             Vector3 lookDirection = bot.LookDirection;
             Vector3 dir = lookDirection.RotateAroundPivot(Vector3.up, Quaternion.Euler(0f, UnityEngine.Random.Range(-180f, 180f), 0f));
             bot.Steering?.LookToDirection(dir);
             yield return new WaitForSeconds(UnityEngine.Random.Range(1, 4f));
+            if (bot == null || bot.IsDead) yield break;
             bot.Steering?.LookToMovingDirection();
         }
 
@@ -672,7 +835,7 @@ namespace ThatsLit
             // if (envDebugTex != null && Time.frameCount % 61 == 0) Graphics.CopyTexture(envTex, envDebugTex);
 
             ThatsLitPlugin.swScoreCalc.MaybeResume();
-                gameworld.ScoreCalculator?.CalculateMultiFrameScore(cloud, fog, rain, gameworld, PlayerLitScoreProfile, Utility.GetInGameDayTime(), ActiveRaidSettings.LocationId);
+                gameworld.ScoreCalculator?.CalculateMultiFrameScore(cloud, fog, rain, gameworld, PlayerLitScoreProfile, Utility.GetInGameDayTime(), gameworld.LocationId);
             ThatsLitPlugin.swScoreCalc.Stop();
 
             if (!PlayerLitScoreProfile.IsProxy)
@@ -683,16 +846,49 @@ namespace ThatsLit
 
 
         }
+        Action<AsyncGPUReadbackRequest> _readbackCallback;
+        bool _destroyed;
+        int _readbackGeneration;
+        int _pendingReadbackGen;
+        void OnReadbackComplete (AsyncGPUReadbackRequest req)
+        {
+            DisposeObserved();
+            // Stale callbacks (component destroyed, brightness disabled, re-enabled, or switched to proxy while the readback was in flight)
+            // are dropped so an old frame can never feed a new profile.
+            if (_destroyed || req.hasError || _pendingReadbackGen != _readbackGeneration) return;
+            var profile = PlayerLitScoreProfile;
+            if (profile == null || profile.IsProxy) return;
+
+            ThatsLitPlugin.swScoreCalc.MaybeResume();
+            observed = new Unity.Collections.NativeArray<Color32>(req.GetData<Color32>(), Unity.Collections.Allocator.Persistent);
+            profile.pendingCountAngleIndex = _pendingReadbackAngle;
+            gameworld?.ScoreCalculator?.PreCalculate(profile, observed, Utility.GetInGameDayTime());
+            ThatsLitPlugin.swScoreCalc.Stop();
+        }
+
         internal float overheadHaxRating;
         internal float OverheadHaxRatingFactor => overheadHaxRating / 10f;
+        // The 24 overhead cast directions, indexed by Time.frameCount % 24 (slice = i % 6, expansion = i / 6),
+        // computed once with the exact same Quaternion formula as before.
+        static readonly Vector3[] overheadCastDirs = BuildOverheadCastDirs();
+        static Vector3[] BuildOverheadCastDirs ()
+        {
+            var dirs = new Vector3[24];
+            for (int i = 0; i < 24; i++)
+            {
+                Vector3 cast = new Vector3(0, 1, 0);
+                int slice = i % 6;
+                int expansion = i / 6;
+                cast = Quaternion.Euler((expansion + 1) * 10, 0, 0) * cast;
+                cast = Quaternion.Euler(0, slice * -60f, 0) * cast;
+                dirs[i] = cast;
+            }
+            return dirs;
+        }
         private bool OverheadHaxCast (Vector3 from, out RaycastHit hit)
         {
-            Vector3 cast = new Vector3(0, 1, 0);
-            int slice = Time.frameCount % 6;
-            int expansion = (Time.frameCount % 24) / 6;
-            cast = Quaternion.Euler((expansion + 1) * 10, 0, 0) * cast;
-            cast = Quaternion.Euler(0, slice * -60f, 0) * cast;
-            
+            Vector3 cast = overheadCastDirs[Time.frameCount % 24];
+
             var ray = new Ray(from, cast);
             return RaycastIgnoreGlass(ray, 30, ambienceRaycastMask, out hit, out var lp);
         }
@@ -724,53 +920,63 @@ namespace ThatsLit
             }
         }
 
-        private bool RaycastIgnoreGlass (Ray ray, float distance, LayerMask mask, out RaycastHit hit, out RaycastHit lastPenetrated, int depth = 0, int maxDepth = 10)
+        static readonly int IgnoreRaycastLayer = LayerMask.NameToLayer("Ignore Raycast");
+        GameObject[] glassObjects = new GameObject[10];
+        int[] glassLayers = new int[10];
+        float[] glassDistances = new float[10];
+        private bool RaycastIgnoreGlass(Ray ray, float distance, LayerMask mask, out RaycastHit hit, out RaycastHit lastPenetrated, int depth = 0, int maxDepth = 10)
         {
-            lastPenetrated = default;
             hit = default;
-            if (distance < 0 || depth++ >= maxDepth) return false;
-
-            if (Physics.Raycast(ray, out hit, distance, mask))
+            lastPenetrated = default;
+            int count = 0;
+            RaycastHit first = default;
+            if (glassObjects.Length < maxDepth)
             {
-                // if (Time.frameCount % 213 == 0)
-                //     EFT.UI.ConsoleScreen.Log($"{hit.collider?.name}");
-                BallisticCollider c = hit.collider?.gameObject?.GetComponent<BallisticCollider>();
-                if (c == null) hit.collider?.transform?.parent?.GetComponent<BallisticCollider>();
-                if ((c == null || (c?.TypeOfMaterial) != MaterialType.Glass) && (c?.TypeOfMaterial) != MaterialType.GlassShattered)
+                Array.Resize(ref glassObjects, maxDepth);
+                Array.Resize(ref glassLayers, maxDepth);
+                Array.Resize(ref glassDistances, maxDepth);
+            }
+            try
+            {
+                for (; distance >= 0f && depth < maxDepth; depth++)
                 {
-                    // if (Time.frameCount % 213 == 0)
-                    //     EFT.UI.ConsoleScreen.Log($"{hit.distance:0.0}m -------> {hit.collider?.name}");
-                    return true; // no ballistic or not glass
-                }
-                else // Glass
-                {
-                    lastPenetrated = hit;
-                    ray.origin = hit.point + ray.direction.normalized * 0.1f;
-                    hit.distance += 0.1f;
-                    var layer = hit.collider.gameObject.layer;
-                    if (hit.collider?.gameObject) hit.collider.gameObject.layer = LayerMask.NameToLayer("Ignore Raycast"); // ignore raycast
-
-                    // if (Time.frameCount % 213 == 0)
-                    //     EFT.UI.ConsoleScreen.Log($"-- #{depth} {lastPenetrated.collider?.gameObject.name} +{hit.distance}m -->");
-
-                    RaycastHit hit2 = default;
-                    if (RaycastIgnoreGlass(ray, distance - hit.distance, mask, out hit2, out lastPenetrated, depth))
+                    if (!Physics.Raycast(ray, out var current, distance, mask)) break;
+                    BallisticCollider c = null;
+                    if (!(current.collider is TerrainCollider))
                     {
-                        if (hit.collider?.gameObject) hit.collider.gameObject.layer = layer; // ignore raycast
-                        hit.distance += hit2.distance;
-                        // if (Time.frameCount % 213 == 0)
-                        //     EFT.UI.ConsoleScreen.Log($"{hit.distance:0.0}m -------> {hit.collider?.name}");
-                        return true; // Solid hit
+                        current.collider.TryGetComponent<BallisticCollider>(out c);
+                        if (c == null) c = current.collider?.transform?.parent?.GetComponent<BallisticCollider>();
                     }
-
-                    if (hit.collider?.gameObject) hit.collider.gameObject.layer = layer; // ignore raycast
-
-                    // if (Time.frameCount % 213 == 0)
-                    //     EFT.UI.ConsoleScreen.Log($"--- #{depth} - - - -  -  -  -    -    -    -");
-                    return false; // Pen quota used up and no solid hit
+                    if (c == null || (c.TypeOfMaterial != MaterialType.Glass && c.TypeOfMaterial != MaterialType.GlassShattered))
+                    {
+                        hit = count == 0 ? current : first;
+                        float totalDistance = current.distance;
+                        for (int i = count - 1; i >= 0; i--) totalDistance = glassDistances[i] + totalDistance;
+                        hit.distance = totalDistance;
+                        return true;
+                    }
+                    if (count == 0) first = current;
+                    var obj = current.collider.gameObject;
+                    glassObjects[count] = obj;
+                    glassLayers[count] = obj.layer;
+                    glassDistances[count++] = current.distance + 0.1f;
+                    obj.layer = IgnoreRaycastLayer;
+                    float advance = current.distance + 0.1f;
+                    distance -= advance;
+                    ray.origin = current.point + ray.direction.normalized * 0.1f;
+                }
+                hit = first;
+                if (count > 0) hit.distance = first.distance + 0.1f;
+                return false;
+            }
+            finally
+            {
+                for (int i = count - 1; i >= 0; i--)
+                {
+                    if (glassObjects[i]) glassObjects[i].layer = glassLayers[i];
+                    glassObjects[i] = null;
                 }
             }
-            return false; // nothing
         }
 
         /// <summary>
@@ -781,14 +987,12 @@ namespace ThatsLit
         /// <param name="step">Steps to perform this frame</param>
         private bool SlicedBubbleSort<T>(T[] subject, int step, int valid) where T : IComparable<T>
         {
-            var sorted = true;
-
-            // Iterate through the array from 0 ~ N-1 as long as step is not used up, swap if left is bigger
-            // if a full loop is done and no swap has been performed, set isFoliageSorted to true and return
-            // if a full loop is done and any swap has been performed, loop again
-            int right = Mathf.Min(valid - 1, subject.Length - 1);
+            if (valid <= 1 || step <= 0) return true;
+            int right = Mathf.Min(valid, subject.Length) - 1;
+            if (right <= 0) return true;
             while (step > 0)
             {
+                bool sorted = true;
                 for (int i = 0; i < right; i++)
                 {
                     if (subject[i].CompareTo(subject[i + 1]) > 0)
@@ -797,22 +1001,11 @@ namespace ThatsLit
                         subject[i] = subject[i + 1];
                         subject[i + 1] = temp;
                         sorted = false;
-                        step--;
                     }
-
-                    if (i == right - 1)
-                    {
-                        if (sorted)
-                        {
-                            return true;
-                        }
-
-                        i = -1;
-                        sorted = true;
-                    }
+                    if (--step == 0) return sorted && i == right - 1;
                 }
+                if (sorted) return true;
             }
-
             return false;
         }
 
@@ -826,6 +1019,12 @@ namespace ThatsLit
 
         private void HandleDebugTextureSettingChanged(object sender, EventArgs e)
         {
+            if (!ThatsLitPlugin.DebugTexture.Value)
+            {
+                if (display) display.enabled = false;
+                return;
+            }
+            if (MonoBehaviourSingleton<GameUI>.Instance == null) return;
             if (slowRT == null)
                 slowRT = new Texture2D(RESOLUTION, RESOLUTION, TextureFormat.RGBA32, false);
             if (display == null)
@@ -842,11 +1041,18 @@ namespace ThatsLit
 
         private void OnDestroy()
         {
+            _destroyed = true;
+            _readbackGeneration++;
+            if (!gquReq.done) gquReq.WaitForCompletion();
+            // Always release the persistent pixel-count buffers (a proxy-requested profile survives DisableBrightness()).
+            DisposeObserved();
+            PlayerLitScoreProfile?.DisposeBuffers();
             DisableBrightness();
             if (display) GameObject.Destroy(display.gameObject);
             if (cam) GameObject.Destroy(cam.gameObject);
-            if (rt) rt.Release();
-            observed.Dispose();
+            if (rt) { rt.Release(); UnityEngine.Object.Destroy(rt); rt = null; }
+            if (slowRT) { UnityEngine.Object.Destroy(slowRT); slowRT = null; }
+            if (gameworld?.AllThatsLitPlayers != null && Player != null) gameworld.AllThatsLitPlayers.Remove(Player);
         }
         float litFactorSample, ambScoreSample;
         static float benchmarkSampleSeenCoef, benchmarkSampleEncountering, benchmarkSampleExtraVisDis, benchmarkSampleScoreCalculator, benchmarkSampleUpdate, benchmarkSampleFUpdate, benchmarkSampleFoliageCheck, benchmarkSampleTerrainCheck, benchmarkSampleGUI, benchmarkSampleNoBushOverride, benchmarkSampleBlindFire;
@@ -934,7 +1140,6 @@ namespace ThatsLit
             if (Player?.IsYourPlayer != true)
                 return;
 
-            var align = GUI.skin.label.alignment;
             if (style == null)
             {
                 style = new GUIStyle(GUI.skin.label)
@@ -959,7 +1164,7 @@ namespace ThatsLit
                     GUILayout.Label("  [That's Lit] Brightness module is disabled in configs or not supported on this map.", style);
             }
 
-            var poseFactor = Player.PoseLevel / Player.Physical.MaxPoseLevel * 0.6f + 0.4f; // crouch: 0.4f
+            var poseFactor = Player.PoseLevel / (Player.Physical != null && Player.Physical.MaxPoseLevel > 0f ? Player.Physical.MaxPoseLevel : 1f) * 0.6f + 0.4f; // crouch: 0.4f
             if (Player.IsInPronePose)
                 poseFactor -= 0.4f; // prone: 0
             poseFactor += 0.05f; // base -> prone -> 0.05f, crouch -> 0.45f
@@ -979,7 +1184,7 @@ namespace ThatsLit
             float cloud = WeatherController.Instance?.WeatherCurve?.Cloudiness ?? 0;
             
             if (layoutCall)
-                infoCache1 = $"  IMPACT: {DebugInfo.lastCalcFrom:0.000} -> {DebugInfo.lastCalcTo0:0.000} -> {DebugInfo.lastCalcTo1:0.000} -> {DebugInfo.lastCalcTo2:0.000} -> {DebugInfo.lastCalcTo3:0.000} -> {DebugInfo.lastCalcTo4:0.000} -> {DebugInfo.lastCalcTo5:0.000} -> {DebugInfo.lastCalcTo6:0.000} -> {DebugInfo.lastCalcTo7:0.000} -> {DebugInfo.lastCalcTo8:0.000}\n ({DebugInfo.lastFactor2:0.000} <- {DebugInfo.lastFactor1:0.000} <- {DebugInfo.lastScore:0.000}) AMB: {ambScoreSample:0.00} LIT: {litFactorSample:0.00} (SAMPLE)\n  AFFECTED: {DebugInfo.calced} (+{DebugInfo.calcedLastFrame})\n  ENCOUNTER: {DebugInfo.encounter}  V.HINT: { DebugInfo.vagueHint }  V.CANCEL: { DebugInfo.vagueHintCancel }  SIG.D: { DebugInfo.signalDanger }\n  LAST SHOT: { lastShotVector } { Time.time - lastShotTime:0.0}s { DebugInfo.lastEncounterShotAngleDelta }deg  -{ DebugInfo.lastEncounteringShotCutoff }x\n  LAST_PARTS: { DebugInfo.lastVisiblePartsFactor} (x9)  G.OVL: { DebugInfo.lastGlobalOverlookChance:P1}\n  V.DIS.COMP: { DebugInfo.lastDisCompThermal }(T)  { DebugInfo.lastDisCompNVG }(NVG)  { DebugInfo.lastDisCompDay }(Day)  { DebugInfo.lastDisComp }  Focus: { DebugInfo.lastNearestFocusAngleX:0.0}degX/{ DebugInfo.lastNearestFocusAngleY:0.0}degY\n  TERRAIN: { terrainScoreHintProne :0.000}/{ terrainScoreHintRegular :0.000}  3x3/5x5: { TerrainDetails?.RecentDetailCount3x3 }/{ TerrainDetails?.RecentDetailCount5x5 } (score-{ PlayerLitScoreProfile?.detailBonusSmooth:0.00})  FOLIAGE: {Foliage?.FoliageScore:0.000} ({Foliage?.FoliageCount}) (H{Foliage?.Nearest?.dis:0.00} to {Foliage?.Nearest?.name}) RAT: { DebugInfo.lastBushRat:0.00}\n  FOG: {fog:0.000} / RAIN: {rain:0.000} / CLOUD: {cloud:0.000} / TIME: {Utility.GetInGameDayTime():0.000} / WINTER: {gameworld.IsWinter}\n  POSE: {poseFactor} SPEED: { Player.Velocity.magnitude :0.000}  INSIDE: { Time.time - lastOutside:0.000}  AMB: { ambienceShadownRating:0.000}  OVH: { overheadHaxRating:0.000}  BNKR: { bunkerTimeClamped:0.000}  SRD: { surroundingRating:0.000}\n  {DebugInfo.nearestOffset}  Caution: { DebugInfo.nearestCaution }  NoBush.Cancel: {DebugInfo.cancelledSAINNoBush}/{DebugInfo.attemptToCancelSAINNoBush} {DebugInfo.lastInterruptChance:P1}  {DebugInfo.lastInterruptChanceDis:0.0}m SNP: {DebugInfo.sniperHintOffset} ({DebugInfo.sniperHintChance:P1})  FL: {flashLightHit.point:000.0}  HINT:{DebugInfo.flashLightHint}\n  F.L:{DebugInfo.forceLooks}  S.L:{DebugInfo.sideLooks}\n Throttle: { !cam.enabled } { cameraThrottleFrequency }";
+                infoCache1 = $"  IMPACT: {DebugInfo.lastCalcFrom:0.000} -> {DebugInfo.lastCalcTo0:0.000} -> {DebugInfo.lastCalcTo1:0.000} -> {DebugInfo.lastCalcTo2:0.000} -> {DebugInfo.lastCalcTo3:0.000} -> {DebugInfo.lastCalcTo4:0.000} -> {DebugInfo.lastCalcTo5:0.000} -> {DebugInfo.lastCalcTo6:0.000} -> {DebugInfo.lastCalcTo7:0.000} -> {DebugInfo.lastCalcTo8:0.000}\n ({DebugInfo.lastFactor2:0.000} <- {DebugInfo.lastFactor1:0.000} <- {DebugInfo.lastScore:0.000}) AMB: {ambScoreSample:0.00} LIT: {litFactorSample:0.00} (SAMPLE)\n  AFFECTED: {DebugInfo.calced} (+{DebugInfo.calcedLastFrame})\n  ENCOUNTER: {DebugInfo.encounter}  V.HINT: { DebugInfo.vagueHint }  V.CANCEL: { DebugInfo.vagueHintCancel }  SIG.D: { DebugInfo.signalDanger }\n  LAST SHOT: { lastShotVector } { Time.time - lastShotTime:0.0}s { DebugInfo.lastEncounterShotAngleDelta }deg  -{ DebugInfo.lastEncounteringShotCutoff }x\n  LAST_PARTS: { DebugInfo.lastVisiblePartsFactor} (x9)  G.OVL: { DebugInfo.lastGlobalOverlookChance:P1}\n  V.DIS.COMP: { DebugInfo.lastDisCompThermal }(T)  { DebugInfo.lastDisCompNVG }(NVG)  { DebugInfo.lastDisCompDay }(Day)  { DebugInfo.lastDisComp }  Focus: { DebugInfo.lastNearestFocusAngleX:0.0}degX/{ DebugInfo.lastNearestFocusAngleY:0.0}degY\n  TERRAIN: { terrainScoreHintProne :0.000}/{ terrainScoreHintRegular :0.000}  3x3/5x5: { TerrainDetails?.RecentDetailCount3x3 }/{ TerrainDetails?.RecentDetailCount5x5 } (score-{ PlayerLitScoreProfile?.detailBonusSmooth:0.00})  FOLIAGE: {Foliage?.FoliageScore:0.000} ({Foliage?.FoliageCount}) (H{Foliage?.Nearest?.dis:0.00} to {Foliage?.Nearest?.name}) RAT: { DebugInfo.lastBushRat:0.00}\n  FOG: {fog:0.000} / RAIN: {rain:0.000} / CLOUD: {cloud:0.000} / TIME: {Utility.GetInGameDayTime():0.000} / WINTER: {gameworld.IsWinter}\n  POSE: {poseFactor} SPEED: { Player.Velocity.magnitude :0.000}  INSIDE: { Time.time - lastOutside:0.000}  AMB: { ambienceShadownRating:0.000}  OVH: { overheadHaxRating:0.000}  BNKR: { bunkerTimeClamped:0.000}\n  {DebugInfo.nearestOffset}  Caution: { DebugInfo.nearestCaution }  NoBush.Cancel: {DebugInfo.cancelledSAINNoBush}/{DebugInfo.attemptToCancelSAINNoBush} {DebugInfo.lastInterruptChance:P1}  {DebugInfo.lastInterruptChanceDis:0.0}m SNP: {DebugInfo.sniperHintOffset} ({DebugInfo.sniperHintChance:P1})  FL: {flashLightHit.point:000.0}  HINT:{DebugInfo.flashLightHint}\n  F.L:{DebugInfo.forceLooks}  S.L:{DebugInfo.sideLooks}\n Throttle: { cam?.enabled != true } { cameraThrottleFrequency }";
             GUILayout.Label(infoCache1, style);
             // GUILayout.Label(string.Format(" FOG: {0:0.000} / RAIN: {1:0.000} / CLOUD: {2:0.000} / TIME: {3:0.000} / WINTER: {4}", WeatherController.Instance?.WeatherCurve?.Fog ?? 0, WeatherController.Instance?.WeatherCurve?.Rain ?? 0, WeatherController.Instance?.WeatherCurve?.Cloudiness ?? 0, GetInGameDayTime(), isWinterCache));
             
@@ -1006,13 +1211,13 @@ namespace ThatsLit
 
             gameworld.ScoreCalculator?.OnGUI(PlayerLitScoreProfile, layoutCall);
 
-            if (ThatsLitPlugin.DebugTerrain.Value && TerrainDetails?.Details5x5 != null)
+            if (ThatsLitPlugin.DebugTerrain.Value && TerrainDetails?.Details5x5 != null && TerrainDetails.DetailTypeStride > 0)
             {
-                infoCache2 = $"  DETAIL (SAMPLE): {DebugInfo?.lastFinalDetailScoreNearest:+0.00;-0.00;+0.00} ({DebugInfo?.lastDisFactorNearest:0.000}df) 3x3: { TerrainDetails.RecentDetailCount3x3}\n  {Utility.DetermineDir(DebugInfo?.lastTriggeredDetailCoverDirNearest ?? Vector3.zero)} {DebugInfo?.lastNearest:0.00}m {DebugInfo?.lastTiltAngle} {DebugInfo?.lastRotateAngle}";
+                if (layoutCall) infoCache2 = $"  DETAIL (SAMPLE): {DebugInfo?.lastFinalDetailScoreNearest:+0.00;-0.00;+0.00} ({DebugInfo?.lastDisFactorNearest:0.000}df) 3x3: { TerrainDetails.RecentDetailCount3x3}\n  {Utility.DetermineDir(DebugInfo?.lastTriggeredDetailCoverDirNearest ?? Vector3.zero)} {DebugInfo?.lastNearest:0.00}m {DebugInfo?.lastTiltAngle} {DebugInfo?.lastRotateAngle}";
                 GUILayout.Label(infoCache2, style);
                 // GUILayout.Label(string.Format(" DETAIL (SAMPLE): {0:+0.00;-0.00;+0.00} ({1:0.000}df) 3x3: {2}", arg0: lastFinalDetailScoreNearest, lastDisFactorNearest, recentDetailCount3x3));
                 // GUILayout.Label(string.Format(" {0} {1:0.00}m {2} {3}", Utility.DetermineDir(lastTriggeredDetailCoverDirNearest), lastNearest, lastTiltAngle, lastRotateAngle));
-                for (int i = TerrainDetails.GetDetailInfoIndex(2, 2, 0, gameworld.MaxDetailTypes); i < TerrainDetails.GetDetailInfoIndex(3, 2, 0, gameworld.MaxDetailTypes); i++) // List the underfoot
+                for (int i = TerrainDetails.GetDetailInfoIndex(2, 2, 0, TerrainDetails.DetailTypeStride); i < TerrainDetails.GetDetailInfoIndex(3, 2, 0, TerrainDetails.DetailTypeStride); i++) // List the underfoot
                     if (TerrainDetails.Details5x5[i].casted)
                         GUILayout.Label($"  { TerrainDetails.Details5x5[i].count } Detail#{i}({ TerrainDetails.Details5x5[i].name }))", style);
                 Utility.GUILayoutDrawAsymetricMeter((int)(DebugInfo.lastFinalDetailScoreNearest / 0.0999f), false, style);

@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using System;
@@ -41,7 +41,16 @@ namespace DrakiaXYZ.VersionChecker
         /// <returns></returns>
         public static bool CheckEftVersion(ManualLogSource Logger, PluginInfo Info, ConfigFile Config = null)
         {
-            int currentVersion = FileVersionInfo.GetVersionInfo(BepInEx.Paths.ExecutablePath).FilePrivatePart;
+            int currentVersion;
+            try
+            {
+                currentVersion = FileVersionInfo.GetVersionInfo(BepInEx.Paths.ExecutablePath).FilePrivatePart;
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning($"Unable to read Tarkov version from '{BepInEx.Paths.ExecutablePath}': {ex.Message}");
+                return false;
+            }
             int buildVersion = BuildVersion;
             if (currentVersion != buildVersion)
             {

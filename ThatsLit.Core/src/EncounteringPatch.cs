@@ -1,15 +1,62 @@
-using SPT.Reflection.Patching;
+﻿using SPT.Reflection.Patching;
 using HarmonyLib;
 using System.Reflection;
 using UnityEngine;
 using Comfort.Common;
 using EFT;
+using System.Collections.Generic;
 
 namespace ThatsLit.Patches.Vision
 {
     public class EncounteringPatch : ModulePatch
     {
-        internal static System.Diagnostics.Stopwatch _benchmarkSW;
+        private static readonly AccessTools.FieldRef<BotAimingData, int> _nextShotMissCountRef
+            = AccessTools.FieldRefAccess<BotAimingData, int>("_nextShotMissCount");
+
+        private static readonly AccessTools.FieldRef<EnemyInfo, EnemyVision> _enemyVisionRef
+            = AccessTools.FieldRefAccess<EnemyInfo, EnemyVision>("_enemyVision");
+        private static readonly AccessTools.FieldRef<EnemyInfo, Dictionary<BodyPartType, EnemyPartVision>> _allPartsVisionRef
+            = AccessTools.FieldRefAccess<EnemyInfo, Dictionary<BodyPartType, EnemyPartVision>>("_allPartsVision");
+
+        /// <summary>
+        /// When SetVisible(true) is cancelled from inside EnemyInfo.CheckLookEnemy, the caller still reads _enemyVision afterwards:
+        /// SetVisibleType(_enemyVision.VisibleType) and, if _enemyVision.Visible, PersonalLastSeenTime/Pos and a ReportAiData with
+        /// the exact position (-> BotsGroup.ReportAboutEnemy). Clear the aggregate vision so nothing is reported, and drop the
+        /// parts below the "visible" threshold so the very next look tick doesn't instantly re-trigger SetVisible(true).
+        /// </summary>
+        private static void SuppressCancelledVision(EnemyInfo enemyInfo)
+        {
+            var ev = _enemyVisionRef(enemyInfo);
+            if (ev != null)
+            {
+                ev.VisibleType = EEnemyPartVisibleType.NotVisible; // setter also sets Visible = false
+                ev.CanShoot = false;
+            }
+            enemyInfo.SetCanShoot(false);
+
+            var parts = _allPartsVisionRef(enemyInfo);
+            if (parts == null) return;
+            foreach (var pv in parts.Values)
+            {
+                if (pv == null) continue;
+                pv.Visible = false;
+                pv.VisibleType = EEnemyPartVisibleType.NotVisible;
+                if (pv.VisibilityLevel > 0.6f) pv.VisibilityLevel = 0.6f;
+                if (pv.VisibilityDuration > 0.25f) pv.VisibilityDuration = 0.25f;
+            }
+        }
+
+        private static void EnsureNextShotMissAtLeast(IBotAiming aim, int minMiss)
+        {
+            if (aim is BotAimingData bad && _nextShotMissCountRef(bad) >= minMiss)
+                return;
+            aim.NextShotMiss(minMiss);
+        }
+        static EncounteringPatch()
+        {
+            new SainAimingDelayResetPatch().Enable();
+        }
+
         protected override MethodBase GetTargetMethod()
         {
             return AccessTools.Method(typeof(EnemyInfo), nameof(EnemyInfo.SetVisible));
@@ -49,8 +96,9 @@ namespace ThatsLit.Patches.Vision
 
             Vector3 botPos = __instance.Owner.Position;
             Vector3 botLookDir = __instance.Owner.GetPlayer.LookDirection;
-            Vector3 botEyeToPlayerBody = __instance.Person.MainParts[BodyPartType.body].Position - __instance.Owner.MainParts[BodyPartType.head].Position;
-            Vector3 botEyeToLastSeenPos = __instance.EnemyLastPositionReal - __instance.Owner.MainParts[BodyPartType.head].Position;
+            var botHead = __instance.Owner.MainParts[BodyPartType.head];
+            Vector3 botEyeToPlayerBody = __instance.Person.MainParts[BodyPartType.body].Position - botHead.Position;
+            Vector3 botEyeToLastSeenPos = __instance.EnemyLastPositionReal - botHead.Position;
             float distance = botEyeToPlayerBody.magnitude;
             var visionDeviation = Vector3.Angle(botLookDir, botEyeToPlayerBody);
             var visionDeviationToLast = Vector3.Angle(botEyeToPlayerBody, botEyeToLastSeenPos);
@@ -123,6 +171,7 @@ namespace ThatsLit.Patches.Vision
                      && __instance.Owner?.Memory?.BotCurrentCoverInfo != null)
                     {
                         __instance?.Owner?.Memory?.Spotted(false, vagueSource);
+                        SuppressCancelledVision(__instance);
                         ThatsLitPlugin.swEncountering.Stop();
                         return false; // Cancel visibllity (SetVisible does not only get called for direct vision... ex: for group members )
                     }
@@ -163,7 +212,7 @@ namespace ThatsLit.Patches.Vision
             if (!__state.triggered || __instance.Owner?.Memory?.GoalEnemy != __instance)
                 return; // Not triggering the patch OR the bot is engaging others
 
-            var aim = __instance.Owner?.AimingData;
+            var aim = __instance.Owner?.AimingManager?.CurrentAiming;
             if (aim == null)
                 return;
 
@@ -186,7 +235,7 @@ namespace ThatsLit.Patches.Vision
 
                 // ~30% chance to force a miss
                 if (rand2 < 0.225f  * (__state.unexpected? 1f : 0.5f) * Mathf.InverseLerp(0, 30, __state.visionDeviation) + 0.2f * Mathf.InverseLerp(0, 5, __instance.Person?.Velocity.magnitude ?? 0))
-                    aim.NextShotMiss();
+                    EnsureNextShotMissAtLeast(aim, 1);
             }
             else if (__state.unexpected)
             {
@@ -198,10 +247,26 @@ namespace ThatsLit.Patches.Vision
 
                 // ~40% chance to force a miss
                 if (rand2 < 0.225f * Mathf.InverseLerp(0, 40f, __state.visionDeviation) + 0.2f * Mathf.InverseLerp(0, 5, __instance.Person?.Velocity.magnitude ?? 0))
-                    aim.NextShotMiss();
+                    EnsureNextShotMissAtLeast(aim, 1);
             }
 
             ThatsLitPlugin.swEncountering.Stop();
+        }
+    }
+
+
+    internal class SainAimingDelayResetPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod()
+        {
+            return AccessTools.Method(typeof(BotAimingData), "CalcTimeShoot");
+        }
+
+        [PatchPostfix]
+        public static void PatchPostfix(BotAimingData __instance)
+        {
+            if (ThatsLitPlugin.SAINLoaded && __instance != null)
+                AccessTools.Field(typeof(BotAimingData), "_nextAimingDelay")?.SetValue(__instance, 0f);
         }
     }
 }

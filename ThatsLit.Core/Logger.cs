@@ -1,6 +1,7 @@
-﻿using BepInEx.Logging;
+using BepInEx.Logging;
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Diagnostics;
 using System.Reflection;
 
@@ -21,22 +22,26 @@ namespace ThatsLit
             if (level != LogLevel.Debug)
             {
                 int max = GetMaxFrames(level);
-                int count = 0;
-                StackTrace stackTrace = new StackTrace();
-                for (int i = 0; i < stackTrace.FrameCount; i++)
+                if (max > 0)
                 {
-                    var method = stackTrace.GetFrame(i).GetMethod();
-                    Type methodType = method.DeclaringType;
+                    int count = 0;
+                    StackTrace stackTrace = new StackTrace();
+                    for (int i = 0; i < stackTrace.FrameCount; i++)
+                    {
+                        var method = stackTrace.GetFrame(i)?.GetMethod();
+                        if (method == null) continue;
+                        Type methodType = method.DeclaringType;
 
-                    if (methodType == typeof(Logger)) continue;
+                        if (methodType == typeof(Logger)) continue;
 
-                    declaringType = declaringType ?? methodType;
-                    methods += "." + method.Name;
+                        declaringType = declaringType ?? methodType;
+                        methods += "." + method.Name;
 
-                    if (count >= max) break;
-                    count++;
+                        count++;
+                        if (count >= max) break;
+                    }
+                    methods = $"[{methods}]:";
                 }
-                methods = $"[{methods}]:";
             }
 
             LastLogData = data;
@@ -57,19 +62,30 @@ namespace ThatsLit
             }
         }
 
-        public static object LastLogData { get; private set; }
+        private static object _lastLogData;
+        public static object LastLogData
+        {
+            get => Volatile.Read(ref _lastLogData);
+            private set => Volatile.Write(ref _lastLogData, value);
+        }
+
+        private static readonly object _logSourcesLock = new object();
 
         private static ManualLogSource SelectLogSource(Type type = null)
         {
-            string name = type?.Name ?? "SAIN";
-            if (!LogSourcesDictionary.ContainsKey(name))
+            string name = type?.Name ?? "ThatsLit";
+            lock (_logSourcesLock)
             {
-                LogSourcesDictionary.Add(name, BepInEx.Logging.Logger.CreateLogSource(name));
+                if (!LogSourcesDictionary.TryGetValue(name, out var source))
+                {
+                    source = BepInEx.Logging.Logger.CreateLogSource(name);
+                    LogSourcesDictionary.Add(name, source);
+                }
+                return source;
             }
-            return LogSourcesDictionary[name];
         }
 
-        public static Dictionary<string, ManualLogSource> LogSourcesDictionary = new Dictionary<string, ManualLogSource>();
+        private static readonly Dictionary<string, ManualLogSource> LogSourcesDictionary = new Dictionary<string, ManualLogSource>();
 
     }
 }

@@ -1,4 +1,4 @@
-// https://github.com/MiraculousNightingale/spt-aki-inventory-organizing-features/blob/master/client-side/InventoryOrganizingFeatures/reflections/ReflectionHelper.cs
+﻿// https://github.com/MiraculousNightingale/spt-aki-inventory-organizing-features/blob/master/client-side/InventoryOrganizingFeatures/reflections/ReflectionHelper.cs
 // University of Illinois/NCSA Open Source License
 
 // Copyright (c) 2021 . All rights reserved.
@@ -159,7 +159,7 @@ namespace ThatsLit
 
         public static Type FindClassTypeByMethodNames(string[] names, Assembly targetAssembly = null, bool searchInAllTypes = false)
         {
-            var key = GenerateCacheKey(names);
+            var key = GenerateCacheKey("method", targetAssembly?.FullName ?? TarkovAssembly?.FullName, searchInAllTypes, names);
             // Take from cache if present
             if (TryGetFromCache(key, out Type cached))
             {
@@ -168,27 +168,25 @@ namespace ThatsLit
 
             targetAssembly ??= TarkovAssembly;
             var types = searchInAllTypes ? AccessTools.AllTypes() : AccessTools.GetTypesFromAssembly(targetAssembly);
-            var validClasses = types.Where(type =>
+            Type result = null;
+            Type secondMatch = null;
+            foreach (var type in types)
             {
-                if (!type.Assembly.Equals(PluginAssembly) && type.IsClass)
-                {
-                    var methods = AccessTools.GetMethodNames(type);
-                    return names.All(searchedMethodName => methods.Contains(searchedMethodName));
-                }
-                return false;
-            });
+                if (type.Assembly.Equals(PluginAssembly) || !type.IsClass) continue;
+                var methods = AccessTools.GetMethodNames(type);
+                if (!names.All(methods.Contains)) continue;
+                if (result == null) result = type;
+                else { secondMatch = type; break; }
+            }
 
-            if (validClasses.Count() > 1)
+            if (secondMatch != null)
             {
                 Logger.LogWarning($"ReflectionHelper.FindClassTypeByMethodNames [AmbiguousMatch-Key]: {key}");
-                foreach (var validClass in validClasses)
-                {
-                    Logger.LogWarning($"ReflectionHelper.FindClassTypeByMethodNames [AmbiguousMatch]: {validClass.AssemblyQualifiedName}");
-                }
+                Logger.LogWarning($"ReflectionHelper.FindClassTypeByMethodNames [AmbiguousMatch]: {result.AssemblyQualifiedName}");
+                Logger.LogWarning($"ReflectionHelper.FindClassTypeByMethodNames [AmbiguousMatch]: {secondMatch.AssemblyQualifiedName}");
                 throw new AmbiguousMatchException();
             }
 
-            var result = validClasses.FirstOrDefault();
             if (result == null) throw GetNotFoundException(key);
 
             // Cache if found
@@ -202,7 +200,7 @@ namespace ThatsLit
 
         public static Type FindClassTypeByFieldNames(string[] names, Assembly targetAssembly = null, bool searchInAllTypes = false)
         {
-            var key = GenerateCacheKey(names);
+            var key = GenerateCacheKey("field", targetAssembly?.FullName ?? TarkovAssembly?.FullName, searchInAllTypes, names);
             // Take from cache if present
             if (TryGetFromCache(key, out Type cached))
             {
@@ -211,27 +209,25 @@ namespace ThatsLit
 
             targetAssembly ??= TarkovAssembly;
             var types = searchInAllTypes ? AccessTools.AllTypes() : AccessTools.GetTypesFromAssembly(targetAssembly);
-            var validClasses = types.Where(type =>
+            Type result = null;
+            Type secondMatch = null;
+            foreach (var type in types)
             {
-                if (!type.Assembly.Equals(PluginAssembly) && type.IsClass)
-                {
-                    var fields = AccessTools.GetFieldNames(type);
-                    return names.All(searchedFieldName => fields.Contains(searchedFieldName));
-                }
-                return false;
-            });
+                if (type.Assembly.Equals(PluginAssembly) || !type.IsClass) continue;
+                var fields = AccessTools.GetFieldNames(type);
+                if (!names.All(fields.Contains)) continue;
+                if (result == null) result = type;
+                else { secondMatch = type; break; }
+            }
 
-            if (validClasses.Count() > 1)
+            if (secondMatch != null)
             {
                 Logger.LogWarning($"ReflectionHelper.FindClassTypeByFieldNames [AmbiguousMatch-Key]: {key}");
-                foreach (var validClass in validClasses)
-                {
-                    Logger.LogWarning($"ReflectionHelper.FindClassTypeByFieldNames [AmbiguousMatch]: {validClass.AssemblyQualifiedName}");
-                }
+                Logger.LogWarning($"ReflectionHelper.FindClassTypeByFieldNames [AmbiguousMatch]: {result.AssemblyQualifiedName}");
+                Logger.LogWarning($"ReflectionHelper.FindClassTypeByFieldNames [AmbiguousMatch]: {secondMatch.AssemblyQualifiedName}");
                 throw new AmbiguousMatchException();
             }
 
-            var result = validClasses.FirstOrDefault();
             if (result == null) throw GetNotFoundException(key);
 
             // Cache if found
@@ -259,24 +255,29 @@ namespace ThatsLit
                 return cached;
             }
 
-            var validMethods = type.GetMethods(bindingAttr).Where(method =>
+            MethodInfo result = null;
+            MethodInfo secondMatch = null;
+            foreach (var method in type.GetMethods(bindingAttr))
             {
                 var parameters = method.GetParameters();
-                return methodArgTypes.All(argType => parameters.Any(param => param.ParameterType == argType));
-            });
+                if (parameters.Length != methodArgTypes.Length) continue;
+                bool matches = true;
+                for (int i = 0; i < parameters.Length; i++)
+                    if (parameters[i].ParameterType != methodArgTypes[i]) { matches = false; break; }
+                if (!matches) continue;
+                if (result == null) result = method;
+                else { secondMatch = method; break; }
+            }
 
-            if (validMethods.Count() > 1)
+            if (secondMatch != null)
             {
                 Logger.LogWarning($"ReflectionHelper.FindMethodByArgTypes [AmbiguousMatch-Key]: {key}");
                 Logger.LogWarning($"ReflectionHelper.FindMethodByArgTypes [AmbiguousMatch-Type-AssemblyQualifiedName]: {type.AssemblyQualifiedName}");
-                foreach (var validMethod in validMethods)
-                {
-                    Logger.LogWarning($"ReflectionHelper.FindMethodByArgTypes [AmbiguousMatch]: {validMethod.Name}");
-                }
+                Logger.LogWarning($"ReflectionHelper.FindMethodByArgTypes [AmbiguousMatch]: {result.Name}");
+                Logger.LogWarning($"ReflectionHelper.FindMethodByArgTypes [AmbiguousMatch]: {secondMatch.Name}");
                 throw new AmbiguousMatchException();
             }
 
-            var result = validMethods.FirstOrDefault();
             if (result == null) throw GetNotFoundException(key);
 
             // Cache if found
@@ -355,16 +356,14 @@ namespace ThatsLit
         {
             var method = GetMethodWithCache(staticType, name, methodArgTypes);
 
+            args ??= Array.Empty<object>();
             var parameters = method.GetParameters();
-            // auto-compensate for default parameters if they aren't provided
-            // or you'll get "Number of parameters specified does not match..."
             if (args.Length < parameters.Length)
             {
+                int suppliedLength = args.Length;
                 Array.Resize(ref args, parameters.Length);
-                for (int i = 0; i < args.Length; i++)
-                {
-                    args[i] ??= Type.Missing;
-                }
+                for (int i = suppliedLength; i < parameters.Length; i++)
+                    args[i] = Type.Missing;
             }
 
             return method.Invoke(null, args);
@@ -435,16 +434,14 @@ namespace ThatsLit
         {
             var method = GetMethodWithCache(targetObj.GetType(), name, methodArgTypes);
 
+            args ??= Array.Empty<object>();
             var parameters = method.GetParameters();
-            // auto-compensate for default parameters if they aren't provided
-            // or you'll get "Number of parameters specified does not match..."
             if (args.Length < parameters.Length)
             {
+                int suppliedLength = args.Length;
                 Array.Resize(ref args, parameters.Length);
-                for (int i = 0; i < args.Length; i++)
-                {
-                    args[i] ??= Type.Missing;
-                }
+                for (int i = suppliedLength; i < parameters.Length; i++)
+                    args[i] = Type.Missing;
             }
 
             return method.Invoke(targetObj, args);

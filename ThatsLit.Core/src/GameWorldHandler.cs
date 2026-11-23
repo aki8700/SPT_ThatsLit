@@ -1,4 +1,4 @@
-﻿using Comfort.Common;
+using Comfort.Common;
 using EFT;
 using System.Collections.Generic;
 using UnityEngine;
@@ -13,6 +13,7 @@ namespace ThatsLit
             if (gameWorld == null && ThatsLitGameWorld != null)
             {
                 Object.Destroy(ThatsLitGameWorld);
+                ThatsLitGameWorld = null;
             }
             else if (gameWorld != null && ThatsLitGameWorld == null)
             {
@@ -23,3 +24,4 @@ namespace ThatsLit
         public static ThatsLitGameworld ThatsLitGameWorld { get; private set; }
     }
 }
+

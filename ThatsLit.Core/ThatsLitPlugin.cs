@@ -22,12 +22,12 @@ namespace ThatsLit
         public const string Trademark = "";
         public const string Culture = "";
 
-        public const int TarkovVersion = 33420;
+        public const int TarkovVersion = 40743;
         public const string EscapeFromTarkov = "EscapeFromTarkov.exe";
         public const string ModName = "That's Lit";
-        public const string ModVersion = "1.3100.3";
+        public const string ModVersion = "1.4100.0";
         public const string SPTGUID = "com.SPT.core";
-        public const string SPTVersion = "3.10.0";
+        public const string SPTVersion = "4.1.0";
         private static long modVersionComparable;
 
         public static long ModVersionComparable
@@ -87,6 +87,8 @@ namespace ThatsLit
             this.StartCoroutine(FikaHelper());
             IEnumerator FikaHelper ()
             {
+                // Headless (batchmode) has no menu UI: never wait for it nor show toasts.
+                if (Application.isBatchMode) yield break;
                 var wait = new WaitForSeconds(1f);
                 while (!PreloaderUI.Instantiated || CommonUI.Instance?.MenuScreen?.isActiveAndEnabled != true)
                     yield return wait;
@@ -97,7 +99,7 @@ namespace ThatsLit
                 {
                     string message = $"[That's Lit] Fika detected, but That's Lit Sync is not installed. Without the extension, you lose extra fps per player. Get Sync from Fika Discord - #mod-releases - That's Lit. Direct link is provided in the console (`).";
                     EFT.UI.ConsoleScreen.Log($"That's Lit Sync: https://discord.com/channels/1202292159366037545/1245739513481924739");
-                    NotificationManagerClass.DisplayWarningNotification(message, EFT.Communications.ENotificationDurationType.Infinite);
+                    Utility.SafeWarningNotification(message, EFT.Communications.ENotificationDurationType.Infinite);
                     Logger.LogError(message);
                 }
             }
@@ -105,15 +107,23 @@ namespace ThatsLit
 
         public void TryCheckUpdate ()
         {
-            var url = "https://raw.githubusercontent.com/No3371/SPT_ThatsLit/main/ThatsLit.Core/.update_notifier";
-            if (!Chainloader.PluginInfos.TryGetValue("bastudio.updatenotifier", out var pluginInfo))
+            // The upstream .update_notifier tracks the SPT 3.10 line, so comparing against it
+            // would only produce false "update available" warnings for this 4.1 port.
+            // Kept as a guarded no-op-by-default so it can never throw during Awake().
+            if (Application.isBatchMode) return;
+            try
             {
-                Logger.LogInfo("Update Notifier not found.");
-                return;
+                if (!Chainloader.PluginInfos.TryGetValue("bastudio.updatenotifier", out var pluginInfo) || pluginInfo?.Instance == null)
+                {
+                    Logger.LogInfo("Update Notifier not found.");
+                    return;
+                }
+                Logger.LogInfo("Update check skipped: no update channel for the SPT 4.1 port.");
             }
-
-            BaseUnityPlugin updntf = pluginInfo.Instance;
-            updntf.GetType().GetMethod("CheckForUpdate", new Type[] { typeof(BaseUnityPlugin), typeof(string)}).Invoke(updntf, new object[] {this, url});
+            catch (Exception e)
+            {
+                Logger.LogWarning($"Update check skipped: {e.Message}");
+            }
         }
 
         private void BindConfigs()
@@ -144,7 +154,9 @@ namespace ThatsLit
 
             category = "2. Darkness / Brightness";
             EnabledLighting            = Config.Bind(category, "Enable", true, new ConfigDescription("Enable the module. With this turned off, AIs are not affected by your brightness.", null, new ConfigurationManagerAttributes() { Order                                                              = 101 }));
-            EnabledCameraThrottling            = Config.Bind(category, "Throttle Camera", false, new ConfigDescription("When the ambience is bright, make the camera only run every some frames to reduce average fps impact.", null, new ConfigurationManagerAttributes() { Order                                                              = 100 }));
+            EnabledCameraThrottling            = Config.Bind(category, "Throttle Camera", false, new ConfigDescription("Cache the 6-angle brightness readings and dynamically rate-limit the brightness camera (bright daylight, active darkness, and stationary idle) to reduce main-thread CPU culling cost without losing stealth accuracy.", null, new ConfigurationManagerAttributes() { Order                                                              = 100 }));
+            CameraMaxRateHz                    = Config.Bind(category, "Camera Max Rate (Hz)", 18, new ConfigDescription("Maximum brightness camera render rate (Hz) when Throttle Camera is enabled (0 = uncapped in darkness). Default 18 Hz completes 3 full 6-angle sweeps per second while moving or reacting to light/pose changes.", new AcceptableValueRange<int>(0, 60), new ConfigurationManagerAttributes() { Order = 99 }));
+            CameraIdleRateHz                   = Config.Bind(category, "Camera Idle Rate (Hz)", 6, new ConfigDescription("Brightness camera render rate (Hz) when Throttle Camera is enabled and the player is stationary with stable pose and lights. Default 6 Hz completes 1 full 6-angle sweep per second.", new AcceptableValueRange<int>(1, 30), new ConfigurationManagerAttributes() { Order = 98 }));
             DarknessImpactScaleOffset        = Config.Bind(category, "Darkness Impact Offset", 0.5f, new ConfigDescription("Scale how AI noticing players slower due to darkness. If That's Lit change bot reaction from 1s to 3s, setting to 100% will makes it 5s (double from 50%). Be careful when increasing this as it could easily breaks the combat balance.", new AcceptableValueRange<float>(0, 1.0f), new ConfigurationManagerAttributes() { Order                                           = 95 }));
             BrightnessImpactScaleOffset      = Config.Bind(category, "Brightness Impact Offset", 0.5f, new ConfigDescription("Scale how AI noticing players faster due to brightness. If That's Lit change bot reaction from 3s to 2s, setting to 100% will makes it 1s (double from 50%; will not make it lower than 50% of original). Be careful when increasing this as it could easily breaks the combat balance.", new AcceptableValueRange<float>(0f, 1.0f), new ConfigurationManagerAttributes() { Order                                       = 94 }));
             ExtraVisionDistanceScale     = Config.Bind(category, "Extra Vision Distance Scale", 1f, new ConfigDescription("Scale how AI noticing players from further under some circumstances. This is designed to compensate low night vision distance from SAIN, you may want to set this to 0 if you don't run SAIN.", new AcceptableValueRange<float>(0, 1f), new ConfigurationManagerAttributes() { Order = 93 }));
@@ -175,6 +187,7 @@ namespace ThatsLit
             EnabledGrasses             = Config.Bind(category, "Enable Grasses", true, new ConfigDescription("Enable the module. This enable grasses to block bot vision.", null, new ConfigurationManagerAttributes() { Order                                                                                    = 100 }));
             EnabledFoliage             = Config.Bind(category, "Enable Foliage", true, new ConfigDescription("Enable the module. This enable foliage to distract distant bots.", null, new ConfigurationManagerAttributes() { Order                                                                                    = 100 }));
             EnabledBushRatting             = Config.Bind(category, "Enable Bush Ratting", true, new ConfigDescription("Enable the module. This enable foliage to distract distant bots.", null, new ConfigurationManagerAttributes() { Order                                                                                    = 100 }));
+            EnableFoliageSpatialGrid       = Config.Bind(category, "Foliage Spatial Grid", true, new ConfigDescription("Pre-index static map foliage colliders into an in-memory 2D spatial broadphase on raid start to skip Physics.OverlapSphereNonAlloc when no static foliage is nearby (runs exact PhysX on contact). Disable if a mod dynamically spawns or moves foliage colliders mid-raid.", null, new ConfigurationManagerAttributes() { Order = 98 }));
             FoliageImpactScale         = Config.Bind(category,
                                             "Foliage Impact Scale",
                                             1f,
@@ -232,7 +245,7 @@ namespace ThatsLit
             IncludeBosses              = Config.Bind(category, "Include Bosses", false, "Should all features from this mod work for boss. Makes bosses EASY.");
             PMCOnlyMode              = Config.Bind(category, "PMC Only Mode", false, "Requested. So the mod only affect PMCs.");
             EnableEquipmentCheck         = Config.Bind(category, "Equipment Check", true, "Whether the mod checks your equipments. Disabling this stops lights/lasers detection and makes stealth EASY.");
-            InterruptSAINNoBush              = Config.Bind(category, "Interrupt SAIN No Bush", false, "DO NOT COMPLAIN ABOUT NO BUSH ESP TO Solarint IF YOU HAVE THIS ON. New SAIN No Bush is designed to be very aggressive, it can block bot vision even if you are just 2m away and the bot is looking straight at you. This add a chance to turn off SAIN's No Bush ESP at close range so things makes sense.");
+            InterruptSAINNoBush              = Config.Bind(category, "Interrupt SAIN No Bush", false, "(No effect with SAIN 4.5.x: SAIN no longer has the No Bush ESP component this hooked.) DO NOT COMPLAIN ABOUT NO BUSH ESP TO Solarint IF YOU HAVE THIS ON. New SAIN No Bush is designed to be very aggressive, it can block bot vision even if you are just 2m away and the bot is looking straight at you. This add a chance to turn off SAIN's No Bush ESP at close range so things makes sense.");
             ForceBlindFireScatter              = Config.Bind(category, "Force Blind Fire Scatter", true, "Force a random scatter on bot blind fireing, scaled by distance.");
             BotLookDirectionTweaks              = Config.Bind(category, "Bot Look Direction Tweaks", true, "Try to tell the nearest bot to look towards the player when it makes sense.");
             
@@ -254,10 +267,13 @@ namespace ThatsLit
         public static ConfigEntry<bool> EnabledMod { get; private set; }
         public static ConfigEntry<bool> EnabledLighting { get; private set; }
         public static ConfigEntry<bool> EnabledCameraThrottling { get; private set; }
+        public static ConfigEntry<int> CameraMaxRateHz { get; private set; }
+        public static ConfigEntry<int> CameraIdleRateHz { get; private set; }
         public static ConfigEntry<bool> EnabledEncountering { get; private set; }
         public static ConfigEntry<bool> EnabledFoliage { get; private set; }
         public static ConfigEntry<bool> EnabledGrasses { get; private set; }
         public static ConfigEntry<bool> EnabledBushRatting { get; private set; }
+        public static ConfigEntry<bool> EnableFoliageSpatialGrid { get; private set; }
         public static ConfigEntry<bool> EnableMovementImpact { get; private set; }
         public static ConfigEntry<bool> EnableEquipmentCheck { get; private set; }
         public static ConfigEntry<bool> EnableSimFreeLook { get; private set; }
@@ -328,12 +344,13 @@ namespace ThatsLit
         private void Patches()
         {
             new SeenCoefPatch().Enable();
+            new PartVisionThresholdPatch().Enable();
             new EncounteringPatch().Enable();
             new ExtraVisibleDistancePatch().Enable();
             new InitiateShotMonitor().Enable();
             new BlindFirePatch().Enable();
-            if (SAINLoaded)
-                new SAINNoBushOverride().Enable();
+            // SAINNoBushOverride is intentionally not enabled: SAIN 4.5.x has no SAIN.Components.SAINNoBushESP,
+            // so enabling it throws PatchException and aborts Awake(). InterruptSAINNoBush is kept as a no-op config.
         }
 
         private void Update()

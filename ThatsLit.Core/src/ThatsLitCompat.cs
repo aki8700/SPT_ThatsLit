@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ThatsLit
@@ -10,155 +11,225 @@ namespace ThatsLit
     {
         public const int MIN_COMPATIBLE_PROTOCOL = 1;
 
-        static ThatsLitCompat()
+        private sealed class CompatSnapshot
         {
-            ScopeTemplates   = new Dictionary<string, ScopeTemplate>();
-            Scopes           = new Dictionary<string, Scope>();
-            GoggleTemplates  = new Dictionary<string, GoggleTemplate>();
-            Goggles          = new Dictionary<string, Goggle>();
-            DeviceTemplates  = new Dictionary<string, DeviceTemplate>();
-            Devices          = new Dictionary<string, Device>();
-            ExtraDevices     = new Dictionary<string, Device>();
+            public readonly Dictionary<string, ScopeTemplate> ScopeTemplates;
+            public readonly Dictionary<string, Scope> Scopes;
+            public readonly Dictionary<string, GoggleTemplate> GoggleTemplates;
+            public readonly Dictionary<string, Goggle> Goggles;
+            public readonly Dictionary<string, DeviceTemplate> DeviceTemplates;
+            public readonly Dictionary<string, Device> Devices;
+            public readonly Dictionary<string, Device> ExtraDevices;
+
+            public CompatSnapshot(
+                Dictionary<string, ScopeTemplate> scopeTemplates,
+                Dictionary<string, Scope> scopes,
+                Dictionary<string, GoggleTemplate> goggleTemplates,
+                Dictionary<string, Goggle> goggles,
+                Dictionary<string, DeviceTemplate> deviceTemplates,
+                Dictionary<string, Device> devices,
+                Dictionary<string, Device> extraDevices)
+            {
+                ScopeTemplates = scopeTemplates;
+                Scopes = scopes;
+                GoggleTemplates = goggleTemplates;
+                Goggles = goggles;
+                DeviceTemplates = deviceTemplates;
+                Devices = devices;
+                ExtraDevices = extraDevices;
+            }
         }
 
-         public static Dictionary<string, ScopeTemplate> ScopeTemplates    { get; private set; }
-         public static Dictionary<string, Scope> Scopes                    { get; private set; }
-         public static Dictionary<string, GoggleTemplate> GoggleTemplates  { get; private set; }
-         public static Dictionary<string, Goggle> Goggles                  { get; private set; }
-         public static Dictionary<string, DeviceTemplate> DeviceTemplates  { get; private set; }
-         public static Dictionary<string, Device> Devices                  { get; private set; }
-         public static Dictionary<string, Device> ExtraDevices             { get; private set; }
+        private static CompatSnapshot _snapshot = new CompatSnapshot(
+            new Dictionary<string, ScopeTemplate>(),
+            new Dictionary<string, Scope>(),
+            new Dictionary<string, GoggleTemplate>(),
+            new Dictionary<string, Goggle>(),
+            new Dictionary<string, DeviceTemplate>(),
+            new Dictionary<string, Device>(),
+            new Dictionary<string, Device>());
+
+        public static Dictionary<string, ScopeTemplate> ScopeTemplates    => Volatile.Read(ref _snapshot).ScopeTemplates;
+        public static Dictionary<string, Scope> Scopes                    => Volatile.Read(ref _snapshot).Scopes;
+        public static Dictionary<string, GoggleTemplate> GoggleTemplates  => Volatile.Read(ref _snapshot).GoggleTemplates;
+        public static Dictionary<string, Goggle> Goggles                  => Volatile.Read(ref _snapshot).Goggles;
+        public static Dictionary<string, DeviceTemplate> DeviceTemplates  => Volatile.Read(ref _snapshot).DeviceTemplates;
+        public static Dictionary<string, Device> Devices                  => Volatile.Read(ref _snapshot).Devices;
+        public static Dictionary<string, Device> ExtraDevices             => Volatile.Read(ref _snapshot).ExtraDevices;
 
 
+        private static readonly object loadLock = new object();
         static Task running;
         public static Task LoadCompatFiles ()
         {
-            if (running != null && running.IsCompleted == false) return running;
-            ScopeTemplates.Clear();
-            Scopes.Clear();
-            GoggleTemplates.Clear();
-            Goggles.Clear();
-            DeviceTemplates.Clear();
-            Devices.Clear();
-            ExtraDevices.Clear();
-            running = Task.Run(() => {
-                List<CompatFile> loaded = new List<CompatFile>();
-                IEnumerable<string> paths = Directory.EnumerateFiles(BepInEx.Paths.PluginPath, "**thatslitcompat.json", SearchOption.AllDirectories);
-                foreach (var path in paths)
-                {
-                    CompatFile file = Newtonsoft.Json.JsonConvert.DeserializeObject<CompatFile>(File.ReadAllText(path));
-                    if (file == null)
-                    {
-                        var message = $"[That's Lit] Invalid thatslitcompat file: { file }";
-                        NotificationManagerClass.DisplayWarningNotification(message);
-                        Logger.LogError(message);
+            lock (loadLock)
+            {
+                if (running != null && !running.IsCompleted) return running;
 
-                        continue;
-                    }
-                    if (file.protocol < MIN_COMPATIBLE_PROTOCOL)
-                    {
-                        var message = $"[That's Lit] Incompatible outdated thatslitcompat file: { file }, minimum compatible protocol: { MIN_COMPATIBLE_PROTOCOL }";
-                        NotificationManagerClass.DisplayWarningNotification(message);
-                        Logger.LogError(message);
-                        continue;
-                    }
-                    file.FilePath = path;
-                    loaded.Add(file);
-                }
-                loaded.Sort();
-                foreach (var f in loaded)
-                {
-                    if (ThatsLitPlugin.DebugCompat.Value)
-                        Logger.LogWarning($"[That's Lit Debug] Loading compat file: { f.FilePath }");
+                var task = Task.Run(() => {
+                    var scopeTemplates   = new Dictionary<string, ScopeTemplate>();
+                    var scopes           = new Dictionary<string, Scope>();
+                    var goggleTemplates  = new Dictionary<string, GoggleTemplate>();
+                    var goggles          = new Dictionary<string, Goggle>();
+                    var deviceTemplates  = new Dictionary<string, DeviceTemplate>();
+                    var devices          = new Dictionary<string, Device>();
+                    var extraDevices     = new Dictionary<string, Device>();
 
-                    if (f.scopeTemplates != null)
-                    foreach (var c in f.scopeTemplates)
+                    List<CompatFile> loaded = new List<CompatFile>();
+                    IEnumerable<string> paths = Directory.EnumerateFiles(BepInEx.Paths.PluginPath, "**thatslitcompat.json", SearchOption.AllDirectories);
+                    foreach (var path in paths)
                     {
-                        ScopeTemplates[c.name] = c;
-                        if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Scope Template: { c.name }");
-                    }
-
-                    if (f.goggleTemplates != null)
-                    foreach (var c in f.goggleTemplates)
-                    {
-                        GoggleTemplates[c.name] = c;
-                        if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Goggle Template: { c.name }");
-                    }
-
-                    if (f.deviceTemplates != null)
-                    foreach (var c in f.deviceTemplates)
-                    {
-                        if (c.modes == null || c.modes.Length == 0)
+                        CompatFile file;
+                        try
                         {
-                            Logger.LogError($"[That's Lit] Device Template: { c.name } have 0 mode defined");
-                            // continue; // keep it for references
+                            file = Newtonsoft.Json.JsonConvert.DeserializeObject<CompatFile>(File.ReadAllText(path));
                         }
-                        DeviceTemplates[c.name] = c;
-                        if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Device Template: { c.name }");
-                    }
-
-                    if (f.scopes != null)
-                    foreach (var c in f.scopes)
-                    {
-                        Scopes[c.id] = c;
-                        if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Scope: { c.id }");
-                    }
-
-                    if (f.goggles != null)
-                    foreach (var c in f.goggles)
-                    {
-                        Goggles[c.id] = c;
-                        if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Goggle: { c.id }");
-                    }
-
-                    if (f.devices != null)
-                    foreach (var c in f.devices)
-                    {
-                        if (c.TemplateInstance == null)
+                        catch (Exception ex)
                         {
-                            Logger.LogError($"[That's Lit] Device: { c.id } template is invalid: { c.template }");
-                            continue;
-                        }
-                        if (c.TemplateInstance.modes == null || c.TemplateInstance.modes.Length == 0)
-                        {
-                            Logger.LogError($"[That's Lit] Device: { c.id } have 0 mode defined");
+                            var message = $"[That's Lit] Failed to load thatslitcompat file: { path } ({ ex.Message })";
+                            Utility.SafeWarningNotification(message);
+                            Logger.LogWarning(message);
                             continue;
                         }
 
-                        Devices[c.id] = c;
-                        if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Device: { c.id }");
+                        if (file == null)
+                        {
+                            var message = $"[That's Lit] Invalid thatslitcompat file: { path }";
+                            Utility.SafeWarningNotification(message);
+                            Logger.LogWarning(message);
+                            continue;
+                        }
+                        if (file.protocol < MIN_COMPATIBLE_PROTOCOL)
+                        {
+                            var message = $"[That's Lit] Incompatible outdated thatslitcompat file: { path }, minimum compatible protocol: { MIN_COMPATIBLE_PROTOCOL }";
+                            Utility.SafeWarningNotification(message);
+                            Logger.LogWarning(message);
+                            continue;
+                        }
+                        file.FilePath = path;
+                        loaded.Add(file);
                     }
+                    loaded.Sort();
 
-                    if (f.extraDevices != null)
-                    foreach (var c in f.extraDevices)
+                    // Pass 1: load all templates across all compat files so cross-file references are order-independent
+                    foreach (var f in loaded)
                     {
-                        if (c.TemplateInstance == null)
-                        {
-                            Logger.LogError($"[That's Lit] Device: { c.id } template is invalid: { c.template }");
-                            continue;
-                        }
-                        if (c.TemplateInstance.modes == null || c.TemplateInstance.modes.Length == 0)
-                        {
-                            Logger.LogError($"[That's Lit] Device: { c.id } have 0 mode defined");
-                            continue;
-                        }
-                        ExtraDevices[c.id] = c;
                         if (ThatsLitPlugin.DebugCompat.Value)
-                            Logger.LogWarning($"[That's Lit Debug] Extra Device: { c.id }");
-                    }
-                }
-            }).ContinueWith(t => {
-                running = null;
-                if (t.IsFaulted) Logger.LogError(t.Exception.Flatten());
-            });
+                            Logger.LogWarning($"[That's Lit Debug] Loading compat file: { f.FilePath }");
 
-            return running;
+                        if (f.scopeTemplates != null)
+                        foreach (var c in f.scopeTemplates)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.name)) continue;
+                            scopeTemplates[c.name] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Scope Template: { c.name }");
+                        }
+
+                        if (f.goggleTemplates != null)
+                        foreach (var c in f.goggleTemplates)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.name)) continue;
+                            goggleTemplates[c.name] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Goggle Template: { c.name }");
+                        }
+
+                        if (f.deviceTemplates != null)
+                        foreach (var c in f.deviceTemplates)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.name)) continue;
+                            if (c.modes == null || c.modes.Length == 0)
+                            {
+                                Logger.LogError($"[That's Lit] Device Template: { c.name } have 0 mode defined");
+                                // continue; // keep it for references
+                            }
+                            deviceTemplates[c.name] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Device Template: { c.name }");
+                        }
+                    }
+
+                    // Pass 2: validate and register items against the completed template dictionaries
+                    foreach (var f in loaded)
+                    {
+                        if (f.scopes != null)
+                        foreach (var c in f.scopes)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.id)) continue;
+                            c.ResolveTemplate(scopeTemplates);
+                            scopes[c.id] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Scope: { c.id }");
+                        }
+
+                        if (f.goggles != null)
+                        foreach (var c in f.goggles)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.id)) continue;
+                            c.ResolveTemplate(goggleTemplates);
+                            goggles[c.id] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Goggle: { c.id }");
+                        }
+
+                        if (f.devices != null)
+                        foreach (var c in f.devices)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.id)) continue;
+                            var templateInstance = c.ResolveTemplate(deviceTemplates);
+                            if (templateInstance == null)
+                            {
+                                Logger.LogError($"[That's Lit] Device: { c.id } template is invalid: { c.template }");
+                                continue;
+                            }
+                            if (templateInstance.modes == null || templateInstance.modes.Length == 0)
+                            {
+                                Logger.LogError($"[That's Lit] Device: { c.id } have 0 mode defined");
+                                continue;
+                            }
+
+                            devices[c.id] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Device: { c.id }");
+                        }
+
+                        if (f.extraDevices != null)
+                        foreach (var c in f.extraDevices)
+                        {
+                            if (c == null || string.IsNullOrEmpty(c.id)) continue;
+                            var templateInstance = c.ResolveTemplate(deviceTemplates);
+                            if (templateInstance == null)
+                            {
+                                Logger.LogError($"[That's Lit] Device: { c.id } template is invalid: { c.template }");
+                                continue;
+                            }
+                            if (templateInstance.modes == null || templateInstance.modes.Length == 0)
+                            {
+                                Logger.LogError($"[That's Lit] Device: { c.id } have 0 mode defined");
+                                continue;
+                            }
+                            extraDevices[c.id] = c;
+                            if (ThatsLitPlugin.DebugCompat.Value)
+                                Logger.LogWarning($"[That's Lit Debug] Extra Device: { c.id }");
+                        }
+                    }
+
+                    Volatile.Write(ref _snapshot, new CompatSnapshot(
+                        scopeTemplates,
+                        scopes,
+                        goggleTemplates,
+                        goggles,
+                        deviceTemplates,
+                        devices,
+                        extraDevices));
+                }).ContinueWith(t => {
+                    if (t.IsFaulted && t.Exception != null) Logger.LogError(t.Exception.Flatten());
+                });
+
+                running = task;
+                return task;
+            }
         }
 
         [System.Serializable]
@@ -167,17 +238,15 @@ namespace ThatsLit
             public string id { get; set; }
             public string template { get; set; }
             private DeviceTemplate templateInstance;
-            public DeviceTemplate TemplateInstance
+            internal DeviceTemplate ResolveTemplate(Dictionary<string, DeviceTemplate> templates)
             {
-                get
+                if (templateInstance == null && !string.IsNullOrEmpty(template))
                 {
-                    if (templateInstance == null)
-                    {
-                        ThatsLitCompat.DeviceTemplates.TryGetValue(template, out templateInstance);
-                    }
-                    return templateInstance;
+                    templates.TryGetValue(template, out templateInstance);
                 }
+                return templateInstance;
             }
+            public DeviceTemplate TemplateInstance => ResolveTemplate(ThatsLitCompat.DeviceTemplates);
         }
 
         [System.Serializable]
@@ -188,13 +257,9 @@ namespace ThatsLit
             public DeviceMode SafeGetMode (int mode, bool fallbackLast = true)
             {
                 if (modes == null || modes.Length == 0) return default;
-                if (modes.Length <= mode)
-                    if (fallbackLast)
-                        if (modes.Length <= 0)
-                            return default;
-                        else
-                            mode = modes.Length - 1;
-                    else return default;
+                if (mode < 0) return default;
+                if (mode >= modes.Length)
+                    return fallbackLast ? modes[modes.Length - 1] : default;
                 return modes[mode];
             }
         }
@@ -205,17 +270,15 @@ namespace ThatsLit
             public string id { get; set; }
             public string template { get; set; }
             private GoggleTemplate templateInstance;
-            public GoggleTemplate TemplateInstance
+            internal GoggleTemplate ResolveTemplate(Dictionary<string, GoggleTemplate> templates)
             {
-                get
+                if (templateInstance == null && !string.IsNullOrEmpty(template))
                 {
-                    if (templateInstance == null)
-                    {
-                        ThatsLitCompat.GoggleTemplates.TryGetValue(template, out templateInstance);
-                    }
-                    return templateInstance;
+                    templates.TryGetValue(template, out templateInstance);
                 }
+                return templateInstance;
             }
+            public GoggleTemplate TemplateInstance => ResolveTemplate(ThatsLitCompat.GoggleTemplates);
         }
 
         [System.Serializable]
@@ -269,7 +332,9 @@ namespace ThatsLit
 
             public int CompareTo(CompatFile other)
             {
-                return priority - other.priority;
+                if (other == null) return 1;
+                int cmp = priority.CompareTo(other.priority);
+                return cmp != 0 ? cmp : string.CompareOrdinal(FilePath, other.FilePath);
             }
         }
 
@@ -280,17 +345,15 @@ namespace ThatsLit
             public string id { get; set; }
             public string template { get; set; }
             private ScopeTemplate templateInstance;
-            public ScopeTemplate TemplateInstance
+            internal ScopeTemplate ResolveTemplate(Dictionary<string, ScopeTemplate> templates)
             {
-                get
+                if (templateInstance == null && !string.IsNullOrEmpty(template))
                 {
-                    if (templateInstance == null)
-                    {
-                        ThatsLitCompat.ScopeTemplates.TryGetValue(template, out templateInstance);
-                    }
-                    return templateInstance;
+                    templates.TryGetValue(template, out templateInstance);
                 }
+                return templateInstance;
             }
+            public ScopeTemplate TemplateInstance => ResolveTemplate(ThatsLitCompat.ScopeTemplates);
         }
 
         [System.Serializable]

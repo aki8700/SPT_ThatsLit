@@ -81,7 +81,8 @@ namespace ThatsLit
             }
             if (thisFrame.pixels == 0) thisFrame.pixels = RESOLUTION * RESOLUTION;
             thisFrame.avgLum = thisFrame.lum / (float)thisFrame.pixels;
-            thisFrame.avgLumNonDark = thisFrame.lum / (float) (thisFrame.pixels - thisFrame.pxD);
+            int nonDark = thisFrame.pixels - thisFrame.pxD;
+            thisFrame.avgLumNonDark = nonDark > 0 ? thisFrame.lum / nonDark : 0f;
             thisFrame.avgLumMultiFrames = (thisFrame.avgLum + player.frame1.avgLum + player.frame2.avgLum + player.frame3.avgLum + player.frame4.avgLum + player.frame5.avgLum) / 6f;
             player.UpdateLumTrackers(thisFrame.avgLumMultiFrames);
             
@@ -135,8 +136,8 @@ namespace ThatsLit
             // =====
             if (player.Player.TerrainDetails != null)
             {
-                float surroundingTerrainScoreProne = Singleton<ThatsLitGameworld>.Instance.CalculateDetailScore(player.Player.TerrainDetails, Vector3.zero, 0, 0).prone;
-                float footTerrainScoreProne = Singleton<ThatsLitGameworld>.Instance.CalculateCenterDetailScore(player.Player.TerrainDetails).prone;
+                float surroundingTerrainScoreProne = gameWorld.CalculateDetailScore(player.Player.TerrainDetails, Vector3.zero, 0, 0).prone;
+                float footTerrainScoreProne = gameWorld.CalculateCenterDetailScore(player.Player.TerrainDetails).prone;
                 var surroundingDetailsScaling = Mathf.Clamp01(surroundingTerrainScoreProne) * 0.667f + Mathf.Clamp01(footTerrainScoreProne) * 0.333f;
                 surroundingDetailsScaling = Mathf.Clamp01(surroundingDetailsScaling);
                 surroundingDetailsScaling *= Mathf.Clamp01((0.6f * player.Player.TerrainDetails.RecentDetailCount3x3 + 0.4f * player.Player.TerrainDetails.RecentDetailCount5x5)/ 60f);
@@ -357,9 +358,12 @@ namespace ThatsLit
 
         protected void StartCountPixels(PlayerLitScoreProfile player, NativeArray<Color32> tex, float thresholdShine, float thresholdHigh, float thresholdHighMid, float thresholdMid, float thresholdMidLow, float thresholdLow)
         {
-            if (player == null || tex == null || !tex.IsCreated) return;
+            if (player == null || !tex.IsCreated) return;
 
-            NativeArray<float> thresholds = new NativeArray<float>(6, Allocator.TempJob);
+            // Persistent buffers: completes any in-flight count first, then zero-clears counted/lum
+            // (same initial state as the former freshly allocated ClearMemory TempJob arrays).
+            player.PrepareBuffers();
+            NativeArray<float> thresholds = player.persistentThresholds;
             thresholds[0] = thresholdShine;
             thresholds[1] = thresholdHigh;
             thresholds[2] = thresholdHighMid;
@@ -371,10 +375,11 @@ namespace ThatsLit
             {
                 thresholds = thresholds,
                 tex = tex,
-                counted = new NativeArray<int>(8 * JobsUtility.MaxJobThreadCount , Allocator.TempJob, NativeArrayOptions.ClearMemory),
-                lum = new NativeArray<float>(2 * JobsUtility.MaxJobThreadCount , Allocator.TempJob, NativeArrayOptions.ClearMemory)
+                counted = player.persistentCounted,
+                lum = player.persistentLum
             };
             player.CountingJobHandle = player.PixelCountingJob.Schedule(tex.Length, tex.Length / 64);
+            player.hasPendingCount = true;
             // Logger.LogInfo(string.Format("F{0} Counting {1} px in batches of {2}", Time.frameCount, tex.Length, tex.Length / 64));
         }
         protected void CompleteCountPixels(PlayerLitScoreProfile player, out int shine, out int high, out int highMid, out int mid, out int midLow, out int low, out int dark, out float lum, out float lumNonDark, out int valid)
@@ -387,19 +392,48 @@ namespace ThatsLit
             var job = player.PixelCountingJob;
             if (player.IsProxy == true)
             {
-                job.Dispose();
+                job.tex = default;
                 player.PixelCountingJob = job;
+                player.DisposeBuffers(); // A proxy never counts locally
                 return;
             }
-            job.tex.Dispose();
-            job.thresholds.Dispose();
-            
+            // Nothing scheduled since the last completion: the former per-frame arrays were already disposed here
+            // (IsCreated == false), so the result was "nothing counted". Keep exactly that.
+            if (!player.hasPendingCount)
+            {
+                if (player.useCachedPixelsOnSkip)
+                {
+                    int start = (player.cachedReadAngleIndex + 1) % 6;
+                    player.cachedReadAngleIndex = start;
+                    for (int k = 0; k < 6; k++)
+                    {
+                        var sample = player.cachedAngleSamples[(start + k) % 6];
+                        if (sample.hasSample)
+                        {
+                            shine = sample.shine;
+                            high = sample.high;
+                            highMid = sample.highMid;
+                            mid = sample.mid;
+                            midLow = sample.midLow;
+                            low = sample.low;
+                            dark = sample.dark;
+                            valid = sample.valid;
+                            lum = sample.lum;
+                            lumNonDark = sample.lumNonDark;
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
+            player.hasPendingCount = false;
+
+            // Persistent buffers are kept for the next readback (released in PlayerLitScoreProfile.DisposeBuffers()).
             if (job.lum.IsCreated) for (int i = 0; i < job.lum.Length; i += 2)
             {
                 lum += job.lum[i];
                 lumNonDark += job.lum[i + 1];
             }
-            job.lum.Dispose();
             if (job.counted.IsCreated)
             for (int i = 0; i < job.counted.Length; i += 8)
             {
@@ -416,7 +450,23 @@ namespace ThatsLit
                                 // Time.frameCount, job.counted[i], job.counted[i+1], job.counted[i+2], job.counted[i+3],
                                 // job.counted[i+4], job.counted[i+5], job.counted[i+6], job.counted[i+7], i/8));
             }
-            job.counted.Dispose();
+            int angleIdx = player.pendingCountAngleIndex;
+            if ((uint)angleIdx >= 6u) angleIdx = 0;
+            player.cachedAngleSamples[angleIdx] = new PlayerLitScoreProfile.CachedPixelSample
+            {
+                shine = shine,
+                high = high,
+                highMid = highMid,
+                mid = mid,
+                midLow = midLow,
+                low = low,
+                dark = dark,
+                valid = valid,
+                lum = lum,
+                lumNonDark = lumNonDark,
+                hasSample = true
+            };
+            player.lastCompletedAngleIndex = angleIdx;
             player.PixelCountingJob = job;
             // Logger.LogInfo(string.Format("F{0} Counted {1} px", Time.frameCount, valid));
 
@@ -719,19 +769,24 @@ namespace ThatsLit
         protected override float CalculateMoonLight(PlayerLitScoreProfile player, string locationId, float time, float cloudiness)
         {
             Data data = player.ScoreCalcData as Data;
-            if (data.IsPlayerInParking) cloudiness = Mathf.Lerp(cloudiness, 1.3f, data.ParkingTransitionFactor);
+            if (data != null && data.IsPlayerInParking) cloudiness = Mathf.Lerp(cloudiness, 1.3f, data.ParkingTransitionFactor);
             return base.CalculateMoonLight(player, locationId, time, cloudiness);
         }
 
         protected override float CalculateSunLight(PlayerLitScoreProfile player, string locationId, float time, float cloudiness)
         {
             Data data = player.ScoreCalcData as Data;
-            if (data.IsPlayerInParking) cloudiness = Mathf.Lerp(cloudiness, 1.3f, data.ParkingTransitionFactor);
+            if (data != null && data.IsPlayerInParking) cloudiness = Mathf.Lerp(cloudiness, 1.3f, data.ParkingTransitionFactor);
             return base.CalculateSunLight(player, locationId, time, cloudiness);
         }
 
         public override float CalculateMultiFrameScore(float cloud, float fog, float rain, ThatsLitGameworld gameWorld, PlayerLitScoreProfile player, float time, string locationId)
         {
+            // Proxy fast path: the base only shifts the frame history and returns 0 for proxies; the parking state
+            // below is never read for a proxy, so skip the per-frame upward raycast.
+            if (player.IsProxy)
+                return base.CalculateMultiFrameScore(cloud, fog, rain, gameWorld, player, time, locationId);
+
             if (player.ScoreCalcData as Data == null)
                 player.ScoreCalcData = new Data();
             Data data = player.ScoreCalcData as Data;
@@ -739,15 +794,25 @@ namespace ThatsLit
             bool isParking = false;
             data.IsOverhead = false;
 
-            if (Physics.Raycast(new Ray(player.Player.Player.MainParts[BodyPartType.head].Position, Vector3.up), out var hit, 5, LayerMaskClass.LowPolyColliderLayerMask))
+            if (Physics.Raycast(new Ray(player.Player.Player.MainParts[BodyPartType.head].Position, Vector3.up), out var hit, 5, LayersMaskController.LowPolyColliderLayerMask))
             {
                 data.IsOverhead = true;
-                if (hit.transform.gameObject.scene.name == "Shopping_Mall_parking_work" && player.Player.transform.position.y < 23.5f) isParking = true;
+                if (player.Player.transform.position.y < 23.5f)
+                {
+                    var scene = hit.transform.gameObject.scene;
+                    if (!parkingScenes.TryGetValue(scene.handle, out isParking))
+                    {
+                        isParking = scene.name == "Shopping_Mall_parking_work";
+                        parkingScenes[scene.handle] = isParking;
+                    }
+                }
             }
 
             if (data.IsPlayerInParking != isParking) data.IsPlayerInParking = isParking;
             return base.CalculateMultiFrameScore(cloud, fog, rain, gameWorld, player, time, locationId);
         }
+
+        readonly System.Collections.Generic.Dictionary<int, bool> parkingScenes = new System.Collections.Generic.Dictionary<int, bool>();
 
         // Characters in the basement floor gets lit up by ambience lighting
         protected override float CalculateBaseAmbienceScore(string locationId, float time, float cloud, PlayerLitScoreProfile player)
@@ -755,9 +820,9 @@ namespace ThatsLit
             if (player.ScoreCalcData as Data == null)
                 player.ScoreCalcData = new Data();
             Data data = player.ScoreCalcData as Data;
-            if (data.IsPlayerInParking)
+            if (data != null && data.IsPlayerInParking)
                 return Mathf.Lerp(base.CalculateBaseAmbienceScore(locationId, time, cloud, player), MinBaseAmbienceScore + 0.15f * cloud , (player.Player.OverheadHaxRatingFactor * player.Player.OverheadHaxRatingFactor) * data.ParkingTransitionFactor);
-            else if (data.IsOverhead)
+            else if (data != null && data.IsOverhead)
             {
                 // Enhance indoor darkness in daytime
                 if (this.CalculateSunLightTimeFactor(locationId, Utility.GetInGameDayTime()) > 0.05f)
@@ -778,7 +843,7 @@ namespace ThatsLit
         protected override float CalculateRawLumScore (FrameStats thisFrame, float lowAmbienceScoreFactor, float hightLightedPixelFactor, PlayerLitScoreProfile player)
         {
             Data data = player.ScoreCalcData as Data;
-            if (!data.IsPlayerInParking)
+            if (data == null || !data.IsPlayerInParking)
                 return base.CalculateRawLumScore(thisFrame, lowAmbienceScoreFactor, hightLightedPixelFactor, player);
 
             float lumScore = (thisFrame.avgLum - MinAmbienceLum) * (PixelLumScoreScale*1.2f) * (1+2f*lowAmbienceScoreFactor* lowAmbienceScoreFactor) * (0.1f + lowAmbienceScoreFactor);
@@ -805,11 +870,12 @@ namespace ThatsLit
 
         protected internal override void OnGUI(PlayerLitScoreProfile player, bool layout = false)
         {
+            if (player == null) return;
             if (player.ScoreCalcData as Data == null)
                 player.ScoreCalcData = new Data();
             Data data = player.ScoreCalcData as Data;
             base.OnGUI(player, layout);
-            if (data.IsPlayerInParking) GUILayout.Label($"  Parking: { data.ParkingTransitionFactor }");
+            if (data != null && data.IsPlayerInParking) GUILayout.Label($"  Parking: { data.ParkingTransitionFactor }");
         }
     }
     public class ShorelineScoreCalculator : ScoreCalculator

@@ -22,7 +22,7 @@ namespace ThatsLit
                 if (sw.IsRunning)
                 {
                     string message = $"[That's Lit] Benchmark stopwatch is not stopped! ({id})";
-                    NotificationManagerClass.DisplayWarningNotification(message);
+                    Utility.SafeWarningNotification(message);
                     Logger.LogWarning(message);
                 }
                 sw.Start();

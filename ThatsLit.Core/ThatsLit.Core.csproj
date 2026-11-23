@@ -3,22 +3,13 @@
   <PropertyGroup>
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>ThatsLit.Core</AssemblyName>
+    <RootNamespace>ThatsLit</RootNamespace>
     <LangVersion>latest</LangVersion>
-    <Version>1.3100.0</Version>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>   
-  </PropertyGroup>
-<!-- 
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
-    <Optimize>False</Optimize>
-  </PropertyGroup> -->
-
-  <PropertyGroup>
-    <!-- folder switch -->
-    <EFTPath>..\..\..</EFTPath>
+    <Version>1.4100.0</Version>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <ManagedAssembliesPath>$(EFTPath)\EscapeFromTarkov_Data\Managed</ManagedAssembliesPath>
     <BepInExPath>$(EFTPath)\BepInEx\core</BepInExPath>
     <PluginsPath>$(EFTPath)\BepInEx\plugins</PluginsPath>
-    <AssemblySearchPaths>$(BepInExPath);$(ManagedAssembliesPath);$(PluginsPath)\spt;</AssemblySearchPaths>
   </PropertyGroup>
 
   <ItemGroup>
@@ -47,11 +38,27 @@
       <Private>False</Private>
     </Reference>
     <Reference Include="Comfort">
-      <Private>False</Private>
       <HintPath>$(ManagedAssembliesPath)\Comfort.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="ItemComponent.Types">
+      <HintPath>$(ManagedAssembliesPath)\ItemComponent.Types.dll</HintPath>
+      <Private>False</Private>
     </Reference>
     <Reference Include="Newtonsoft.Json">
       <HintPath>$(ManagedAssembliesPath)\Newtonsoft.Json.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="netstandard">
+      <HintPath>$(ManagedAssembliesPath)\netstandard.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Sirenix.Serialization">
+      <HintPath>$(ManagedAssembliesPath)\Sirenix.Serialization.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(ManagedAssembliesPath)\Unity.TextMeshPro.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine">
@@ -70,103 +77,41 @@
       <HintPath>$(ManagedAssembliesPath)\UnityEngine.AudioModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="UnityEngine.AudioModule">
-      <HintPath>$(ManagedAssembliesPath)\Unity.TextMeshPro.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.AudioModule">
-      <HintPath>$(ManagedAssembliesPath)\Sirenix.Serialization.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
-    <Reference Include="UnityEngine.InputLegacyModule.dll">
+    <Reference Include="UnityEngine.InputLegacyModule">
       <HintPath>$(ManagedAssembliesPath)\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="ItemComponent.Types" />
-    <Reference Include="UnityEngine.JSONSerializeModule" />
-    <Reference Include="UnityEngine.IMGUIModule" />
-    <Reference Include="UnityEngine.PhysicsModule.dll">
+    <Reference Include="UnityEngine.JSONSerializeModule">
+      <HintPath>$(ManagedAssembliesPath)\UnityEngine.JSONSerializeModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(ManagedAssembliesPath)\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
       <HintPath>$(ManagedAssembliesPath)\UnityEngine.PhysicsModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="UnityEngine.TerrainModule.dll">
+    <Reference Include="UnityEngine.TerrainPhysicsModule">
+      <HintPath>$(ManagedAssembliesPath)\UnityEngine.TerrainPhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TerrainModule">
       <HintPath>$(ManagedAssembliesPath)\UnityEngine.TerrainModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="UnityEngine.TextRenderingModule" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System">
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(ManagedAssembliesPath)\UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
 
   <ItemGroup>
-    <Reference Update="System.Core">
-      <Private>False</Private>
-    </Reference>
+    <None Include="Packed\**\*.*" CopyToOutputDirectory="PreserveNewest" LinkBase="Packed" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Reference Update="System.Data">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System.Drawing">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System.IO.Compression.FileSystem">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System.Numerics">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System.Runtime.Serialization">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System.Xml">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Reference Update="System.Xml.Linq">
-      <Private>False</Private>
-    </Reference>
-  </ItemGroup>
-
-  <Target Name="CopyOutput" AfterTargets="Build">
-      <ItemGroup>
-          <!-- Because this ItemGroup is inside the target, this will enumerate
-                all files just before calling Copy. If the ItemGroup were outside
-                the target , it would enumerate the files during evaluation, before
-                the build starts, which may miss files created during the build. -->
-          <PackedFiles Include="$(ProjectDir)\Packed\*.*"/>
-      </ItemGroup>
-    <Message Text="Copying new build to dist" Importance="High" />
-
-    <Copy
-      SourceFiles="$(TargetDir)$(AssemblyName).dll"
-      DestinationFolder="$(PluginsPath)\ThatsLit" />
-    <Copy
-      SourceFiles="@(PackedFiles)"
-      DestinationFolder="$(PluginsPath)\ThatsLit" />
-
-    <Message Text="Copied build files" Importance="High" />
+  <Target Name="RequireEFTPath" BeforeTargets="PrepareForBuild" Condition="'$(EFTPath)' == ''">
+    <Error Text="Set EFTPath to the SPT installation directory." />
   </Target>
 </Project>
